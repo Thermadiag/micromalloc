@@ -1,0 +1,1032 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2024 Victor Moncada <vtr.moncada@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+
+#ifndef MICRO_ALLOCATOR_HPP
+#define MICRO_ALLOCATOR_HPP
+
+#ifdef _MSC_VER
+ // Remove useless warnings ...needs to have dll-interface to be used by clients of class...
+#pragma warning( push )
+#pragma warning( disable : 4251)
+#endif
+
+#include "headers.hpp"
+#include "page_map.hpp"
+#include "statistics.hpp"
+#include "page_provider.hpp"
+#include "tiny_mem_pool.hpp"
+#include "../parameters.hpp"
+#include "../logger.hpp"
+
+extern "C" {
+#include "../enums.h"
+}
+
+
+
+#if defined( __linux__) || defined(__CYGWIN__)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#elif defined (_MSC_VER)
+#include "Windows.h"
+#endif
+
+// Undefine min/max due to Windows.h inclusion without NOMINMAX defined
+#ifdef min
+#undef min
+#undef max
+#endif
+
+#ifdef small
+#undef small
+#endif
+
+#define ALLOCATOR_INLINE MICRO_ALWAYS_INLINE
+MICRO_PUSH_DISABLE_OLD_STYLE_CAST
+
+namespace micro
+{
+	namespace detail
+	{
+		ALLOCATOR_INLINE std::uint64_t Mixin64(std::uint64_t a) noexcept
+		{
+			a ^= a >> 23;
+			a *= 0x2127599bf4325c37ULL;
+			a ^= a >> 47;
+			return a;
+		}
+		template<size_t Size>
+		struct Mixin
+		{
+			static ALLOCATOR_INLINE size_t mix(size_t a) noexcept
+			{
+				return static_cast<size_t>(Mixin64(a));
+			}
+		};
+		template<>
+		struct MICRO_EXPORT_CLASS Mixin<8>
+		{
+			static ALLOCATOR_INLINE size_t mix(size_t a) noexcept
+			{
+#ifdef MICRO_HAS_FAST_UMUL128
+				static constexpr uint64_t k = 0xde5fb9d2630458e9ULL;
+				uint64_t l, h;
+				umul128(a, k, &l, &h);
+				return static_cast<size_t>(h + l);
+#else
+				return static_cast<size_t>(Mixin64(a));
+#endif
+			}
+		};
+		/// @brief Mix input hash value for better avalanching
+		static ALLOCATOR_INLINE size_t HashFinalize(size_t h) noexcept
+		{
+			return detail::Mixin<sizeof(size_t)>::mix(h);
+		}
+
+		/// @brief Returns hash value for current thread id
+		static ALLOCATOR_INLINE size_t this_thread_id_hash()
+		{
+#ifdef MICRO_HAS_FAST_UMUL128
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+			return HashFinalize((size_t)GetCurrentThreadId()) ;
+#else
+			return HashFinalize((size_t)pthread_self()) ;
+#endif
+#else
+			return std::hash<std::thread::id>{}(std::this_thread::get_id());
+#endif
+		}
+
+
+		/// @brief Radix tree parameters based on its maximum size in bits
+		template<size_t MaxSize = MICRO_MAX_RADIX_SIZE>
+		class RadixAccess;
+
+		/// @brief Radix tree parameters for a maximum size of 16 (64 bits plateform)
+		template<>
+		class RadixAccess<16>
+		{
+		public:
+			static constexpr unsigned max_bits = 16;
+			static constexpr unsigned l0_size = 32;
+			static constexpr unsigned l1_size = 32;
+			static constexpr unsigned l2_size = 64;
+
+			static constexpr unsigned max_small_size = 1008; 
+
+			// 5 bits for levels 0 and 1, 6 bits for level 2
+			using l0_type = std::uint32_t;
+			using l1_type = std::uint32_t;
+			using l2_type = std::uint64_t;
+
+			static ALLOCATOR_INLINE std::uint16_t radix_0(unsigned elems) noexcept { return (std::uint16_t)(elems >> 11u); }
+			static ALLOCATOR_INLINE std::uint16_t radix_1(unsigned elems) noexcept { return (std::uint16_t)((elems >> 6u) & 31u); }
+			static ALLOCATOR_INLINE std::uint16_t radix_2(unsigned elems) noexcept { return (std::uint16_t)(elems & 63u); }
+
+			static ALLOCATOR_INLINE std::uint16_t index_0(l0_type m) noexcept { return (std::uint16_t)bit_scan_forward_32(m); }
+			static ALLOCATOR_INLINE std::uint16_t index_1(l1_type m) noexcept { return (std::uint16_t)bit_scan_forward_32(m); }
+			static ALLOCATOR_INLINE std::uint16_t index_2(l2_type m) noexcept { return (std::uint16_t)bit_scan_forward_64(m); }
+		};
+
+		
+		/// @brief Radix tree parameters for a maximum size of 15 (32 bits plateform)
+		template<>
+		class MICRO_EXPORT_CLASS RadixAccess<15>
+		{
+		public:
+			static constexpr unsigned max_bits = 15;
+			static constexpr unsigned l0_size = 32;
+			static constexpr unsigned l1_size = 32;
+			static constexpr unsigned l2_size = 32;
+
+			static constexpr unsigned max_small_size = 496;
+
+			// 5 bits for all levels, this avoid a costly bit_scan_forward_64 on 32 bits platforms
+			using l0_type = std::uint32_t;
+			using l1_type = std::uint32_t;
+			using l2_type = std::uint32_t;
+
+			static ALLOCATOR_INLINE std::uint16_t radix_0(unsigned elems) noexcept { return (std::uint16_t)(elems >> 10u); }
+			static ALLOCATOR_INLINE std::uint16_t radix_1(unsigned elems) noexcept { return (std::uint16_t)((elems >> 5u) & 31u); }
+			static ALLOCATOR_INLINE std::uint16_t radix_2(unsigned elems) noexcept { return (std::uint16_t)(elems & 31u); }
+
+			static ALLOCATOR_INLINE std::uint16_t index_0(l0_type m) noexcept { return (std::uint16_t)bit_scan_forward_32(m); }
+			static ALLOCATOR_INLINE std::uint16_t index_1(l1_type m) noexcept { return (std::uint16_t)bit_scan_forward_32(m); }
+			static ALLOCATOR_INLINE std::uint16_t index_2(l2_type m) noexcept { return (std::uint16_t)bit_scan_forward_32(m); }
+		};
+
+		
+
+
+
+		/// @brief Leaf of a radix tree, holds up to 64 free chunks
+		struct MICRO_EXPORT_CLASS RadixLeaf
+		{
+			using lock_type = spinlock;
+			using mask_type = typename RadixAccess<>::l2_type;
+
+			RadixLeaf() noexcept
+			{
+				memset(data, 0, sizeof(data));
+			}
+
+			std::atomic<mask_type> mask{ 0 };					// Mask of non null positions
+			unsigned parent_index{ 0 };							// Index in parent RadixLevel1
+			RadixLevel1* parent{ nullptr };						// Pointer to parent RadixLevel1
+			lock_type locks[RadixAccess<>::l2_size];			// One lock per position
+			MediumChunkHeader* data[RadixAccess<>::l2_size];	// Array of free MediumChunkHeader. Each entry is a linked list of MediumChunkHeader.
+		};
+
+
+
+		/// @brief Intermediate layer of a radix tree
+		class MICRO_EXPORT_CLASS RadixLevel1
+		{
+			friend class RadixTree;
+			using mask_type = typename RadixAccess<>::l1_type;
+
+			std::atomic<mask_type> mask{ 0 };						// Mask of non null positions
+			unsigned parent_index{ 0 };								// Index in parent RadixTree
+			BaseMemoryManager* mgr{ nullptr };						// Parent memory manager used to allocate leaves
+			std::atomic<RadixLeaf*> data[RadixAccess<>::l1_size];	// Array of leaves
+
+			// Allocate a leaf
+			RadixLeaf* alloc(unsigned pos) noexcept;
+
+		public:
+			RadixLevel1() noexcept
+			{
+				memset((void*)data, 0, sizeof(data));
+			}
+
+			// Returns (and potentially allocate) the leaf at given position
+			ALLOCATOR_INLINE RadixLeaf* get(unsigned pos) noexcept {
+				RadixLeaf* l = data[pos].load(std::memory_order_relaxed);
+				if (MICRO_UNLIKELY(!l))
+					l = alloc(pos);
+				return l;
+			}
+		};
+
+
+		/// @brief Match in a radix tree
+		struct MICRO_EXPORT_CLASS Match {
+			std::uint16_t index0{ 0 };		// First level position
+			std::uint16_t index1{ 0 };		// Second level position
+			std::uint16_t index2{ 0 };		// Leaf position
+			RadixLevel1* l1{ nullptr };		// Second level pointer
+			RadixLeaf* ch{ nullptr };		// Leaf pointer
+		};
+
+
+
+		/// @brief Check previous and next MediumChunkHeader for given header
+		/// For debug build only
+		static inline bool check_prev_next(MediumChunkHeader* f)
+		{
+#ifdef MICRO_DEBUG
+			MediumChunkHeader* end = (MediumChunkHeader*)((char*)f->parent() + f->parent()->run_size());
+			MediumChunkHeader* p = f - f->offset_prev;//(MediumChunkHeader*)((char*)f - f->offset_prev);
+			MediumChunkHeader* n = (MediumChunkHeader*)((char*)f + f->block_bytes());
+			MICRO_ASSERT_DEBUG(p == f || p == (f - f->offset_prev), "");
+			MICRO_ASSERT_DEBUG(p == f || (p + p->elems + 1) == f, "");
+			MICRO_ASSERT_DEBUG(n >= end || f == (n - n->offset_prev), "");
+			MICRO_ASSERT_DEBUG(p->parent() == f->parent(), "");
+			MICRO_ASSERT_DEBUG(n >= end || n->parent() == f->parent(), "");
+#else
+			(void)f;
+#endif
+			return true;
+		}
+
+
+		/// @brief Radix tree
+		///
+		/// RadixTree is a 3 level radix tree that can hold at most
+		/// 65535 entries (64 bits). The radix tree is used to store
+		/// free chunks of memory that can be splitted and merged 
+		/// depending on requested allocation sizes.
+		/// 
+		/// The allocation granulariy of the radix tree is 16 bytes, and
+		/// a radix tree can store entries of at most 1MB.
+		/// 
+		/// The radix tree provides fast and parallel a best fit algorithm
+		/// implementation.
+		/// 
+		class MICRO_EXPORT_CLASS RadixTree
+		{
+			friend class RadixLevel1;
+			using lock_type = spinlock;
+			using mask_type = typename RadixAccess<>::l0_type;
+			using shared_lock_type = PageRunHeader::shared_lock_type;
+
+			std::atomic<mask_type> mask{ 0 };							// mask of empty slots
+			std::atomic <RadixLevel1*> data[RadixAccess<>::l0_size];	// array of level1 entries
+			BaseArena* arena{ nullptr };								// parent arena
+			std::atomic<RadixLeaf*> left_most{ nullptr };				// pointer to the left most leaf used for small allocations
+
+			RadixLevel1* alloc(unsigned pos) noexcept;
+
+			/// @brief Returns (and potentially allocate) the RadixLevel1 object at given position
+			ALLOCATOR_INLINE RadixLevel1* get(unsigned pos) noexcept {
+				RadixLevel1* l = data[pos].load(std::memory_order_relaxed);
+				if (MICRO_UNLIKELY(!l))
+					l = alloc(pos);
+				return l;
+			}
+
+			/// @brief Lower bound algorithm.
+			/// Find an empty slot of size >= elems, where elems is given in 16 bytes granularity.
+			/// If found, the output Match object will contain the position of found entry.
+			/// Returns the match leaf on success, null otherwise.
+			ALLOCATOR_INLINE RadixLeaf* lower_bound(unsigned elems, Match& m) noexcept
+			{
+				m.index0 = RadixAccess<>::radix_0(elems);
+				m.index1 = RadixAccess<>::radix_1(elems);
+				m.index2 = RadixAccess<>::radix_2(elems);
+				
+				typename RadixAccess<>::l0_type mask0;
+				typename RadixAccess<>::l1_type mask1;
+				typename RadixAccess<>::l2_type mask2;
+
+			L0:
+				// Search in level 0
+				mask0 = this->mask.load(std::memory_order_relaxed) >> m.index0;
+				if (MICRO_UNLIKELY(!mask0 || m.index0 >= RadixAccess<>::l0_size))
+					// Nothing found: no chunk greater or equal, return
+					return m.ch = nullptr;
+				m.index0 = RadixAccess<>::index_0(mask0) + m.index0;
+				m.l1 = this->get(m.index0);
+
+				if (MICRO_UNLIKELY(!m.l1))
+					return m.ch = nullptr;
+
+				// We had to go to a greater L0 size: not need to use the exact indexes anymore
+				if (!(mask0 & 1)) {
+					m.index1 = 0;
+					m.index2 = 0;
+				}
+
+			L1:
+				// Search in level 1
+				mask1 = m.l1->mask.load(std::memory_order_relaxed) >> m.index1;
+				if (!mask1 || m.index1 >= RadixAccess<>::l1_size) {
+					// Start looking at size greater than requested size
+					m.index0++;
+					m.index1 = 0;
+					m.index2 = 0;
+					goto L0;
+				}
+				// We had to go to a greater L1 size: not need to use the exact indexes anymore
+				if (!(mask1 & 1)) {
+					m.index2 = 0;
+				}
+				m.index1 = RadixAccess<>::index_1(mask1) + m.index1;
+				m.ch = m.l1->get(m.index1);
+
+				if (MICRO_UNLIKELY(!m.ch))
+					return m.ch;
+
+				// Search in leaf
+				mask2 = m.ch->mask.load(std::memory_order_relaxed) >> m.index2;
+				if (!mask2) {
+					// Perfect fit so far: increment index1 and retry from there
+					++m.index1;
+					m.index2 = 0;
+					goto L1;
+				}
+				m.index2 = RadixAccess<>::index_2(mask2) + m.index2;
+				return m.ch;
+				
+			}
+
+
+			/// @brief Lower bound search in the radix tree.
+			/// If a valid entry is found, the corresponding position is locked.
+			ALLOCATOR_INLINE RadixLeaf* lower_bound_lock(unsigned elems, Match& m) noexcept
+			{
+				while(MICRO_LIKELY(lower_bound(elems, m))) {
+						m.ch->locks[m.index2].lock();
+						if (MICRO_LIKELY(m.ch->data[m.index2])) {
+							MICRO_ASSERT_DEBUG(m.ch->data[m.index2]->th.guard == MICRO_BLOCK_GUARD, "");
+							MICRO_ASSERT_DEBUG(m.ch->data[m.index2]->th.status == MICRO_ALLOC_FREE, "");
+							return m.ch;
+						}
+						m.ch->locks[m.index2].unlock();
+				}
+				return nullptr;
+			}
+
+			/// @brief Remove entry at given position.
+			/// The entry lock must be held.
+			ALLOCATOR_INLINE MediumChunkHeader* remove_free_link(const Match& m) noexcept
+			{
+				MediumChunkHeader* n = m.ch->data[m.index2];
+				MICRO_ASSERT_DEBUG(check_prev_next(n), "");
+				m.ch->data[m.index2] = n->next();
+				if (m.ch->data[m.index2]) {
+					m.ch->data[m.index2]->set_prev(nullptr);
+					MICRO_ASSERT_DEBUG(m.ch->data[m.index2]->th.status == MICRO_ALLOC_FREE, "");
+				}
+				return n;
+			}
+
+			/// @brief Fills Match object using free slot size (in 16 bytes granularity)
+			ALLOCATOR_INLINE void get_free(unsigned elems, Match& m) noexcept
+			{
+				m.index0 = RadixAccess<>::radix_0(elems);
+				m.index1 = RadixAccess<>::radix_1(elems);
+				m.index2 = RadixAccess<>::radix_2(elems);
+
+				// No need to check results of get() as we know the leaf is already allocated
+				// TODO: in fact we need to check
+
+				m.l1 = this->get(m.index0);
+				m.ch = m.l1->get(m.index1);
+			}
+
+			/// @brief Fills Match object using free slot size (in 16 bytes granularity)
+			ALLOCATOR_INLINE void get_free_no_check(unsigned elems, Match& m) noexcept
+			{
+				m.index0 = RadixAccess<>::radix_0(elems);// elems >> 11u;
+				m.index1 = RadixAccess<>::radix_1(elems);//(elems >> 6u) & 31u;
+				m.index2 = RadixAccess<>::radix_2(elems);//(elems & 63u);
+
+				// No need to check results of get() as we know the leaf is already allocated
+				m.l1 = this->data[m.index0].load(std::memory_order_relaxed);
+				MICRO_ASSERT_DEBUG(m.l1, "");
+				m.ch = m.l1->data[m.index1].load(std::memory_order_relaxed);
+				MICRO_ASSERT_DEBUG(m.ch, "");
+			}
+
+			/// @brief Insert new entry in the linked list at given position.
+			/// Entry lock must be held.
+			ALLOCATOR_INLINE void insert_free_link(MediumChunkHeader* h, const Match& m) noexcept
+			{
+				MICRO_ASSERT_DEBUG(check_prev_next(h), "");
+				h->set_next(m.ch->data[m.index2]);
+				h->set_prev(nullptr);
+				if (m.ch->data[m.index2])
+					m.ch->data[m.index2]->set_prev(h);
+				m.ch->data[m.index2] = h;
+				MICRO_ASSERT_DEBUG(m.ch->data[m.index2]->th.status == MICRO_ALLOC_FREE, "");
+			}
+
+			/// @brief Insert new entry in the tree, and fill its position.
+			/// Thread safe function.
+			ALLOCATOR_INLINE void insert_free(MediumChunkHeader* h, Match& m) noexcept
+			{
+				get_free(h->elems, m);
+				
+				std::lock_guard<lock_type> ll(m.ch->locks[m.index2]);
+				insert_free_link(h, m);
+				
+				m.ch->mask.fetch_or((typename RadixAccess<>::l2_type)1 << m.index2, std::memory_order_relaxed);
+				m.l1->mask.fetch_or((typename RadixAccess<>::l1_type)1 << m.index1, std::memory_order_relaxed);
+				this->mask.fetch_or((typename RadixAccess<>::l0_type)1 << m.index0, std::memory_order_relaxed);
+			}
+
+			/// @brief Update tree masks base on leaf one
+			void invalidate_masks(RadixLeaf* ch) noexcept;
+
+			/// @brief Add a new free chunk of size MICRO_BLOCK_SIZE bytes to the tree
+			bool add_new() noexcept;
+			
+			/// @brief Split chunk
+			MediumChunkHeader* split_chunk(MediumChunkHeader* h, PageRunHeader* parent, unsigned elems_1) const noexcept
+			{
+				//MICRO_ASSERT_DEBUG(check_prev_next(h), "");
+				MediumChunkHeader* new_free = h + elems_1;
+				new (new_free) MediumChunkHeader(
+					elems_1, 
+					h->elems - elems_1, 
+					MICRO_ALLOC_FREE,
+					(unsigned)(((char*)new_free - (char*)parent) >> MICRO_ELEM_SHIFT));
+				
+				// update h size
+				h->elems = elems_1 - 1;
+
+				//update next chunk prev offset
+				MediumChunkHeader* next = new_free + new_free->elems + 1;
+				if (next < (MediumChunkHeader*)parent->end()) {
+					next->offset_prev = (unsigned)(next - new_free);
+					//MICRO_ASSERT_DEBUG(check_prev_next(next), "");
+				}
+
+				//MICRO_ASSERT_DEBUG(check_prev_next(h), "");
+				//MICRO_ASSERT_DEBUG(check_prev_next(new_free), "");
+				return new_free;
+			}
+
+			
+			/// @brief Remove entry from the tree.
+			/// Thread safe function.
+			ALLOCATOR_INLINE void remove_from_list(MediumChunkHeader* c) noexcept
+			{
+				Match m;
+				get_free_no_check(c->elems, m);
+
+				std::lock_guard<lock_type> ll(m.ch->locks[m.index2]);
+				// remove free chunk from tree
+				
+				MediumChunkHeader* p = c->prev();
+				MediumChunkHeader* n = c->next();
+				if (n) n->set_prev(p);
+				if (p) p->set_next(n);
+				else {
+					//if (!n) return;
+					MICRO_ASSERT_DEBUG(m.ch->data[m.index2] == c, "");
+					auto mask_ = (typename RadixAccess<>::l2_type)1 << m.index2;
+					m.ch->data[m.index2] = n;
+					if (MICRO_UNLIKELY(!n && m.ch->mask.fetch_and(~mask_) == mask_)) {
+						// invalidate mask
+						invalidate_masks(m.ch);
+					}
+				}
+			}
+
+			/// @brief Merge blocks
+			ALLOCATOR_INLINE MediumChunkHeader* merge_previous(MediumChunkHeader* p, MediumChunkHeader* f, MediumChunkHeader* n, MediumChunkHeader* end) noexcept 
+			{
+				if (n < end) {
+					MICRO_ASSERT_DEBUG(n - n->offset_prev == f, "");
+					n->offset_prev = (unsigned)(n - p);
+				}
+				remove_from_list(p);
+				//merge 
+				p->elems += 1u + f->elems;
+				return p;
+			}
+
+			/// @brief Merge blocks
+			ALLOCATOR_INLINE MediumChunkHeader* merge_next(MediumChunkHeader* , MediumChunkHeader* f, MediumChunkHeader* n, MediumChunkHeader* end) noexcept 
+			{
+				unsigned elems_1 = n->elems + 1;
+				auto* nn = n + elems_1;
+
+				remove_from_list(n);
+
+				//merge
+				f->elems += elems_1;
+				// update next chunk
+				if (nn < end)
+					nn->offset_prev = (unsigned)(nn - f);
+				return f;
+			}
+
+			/// @brief Returns the left most leaf, used for small allocations
+			RadixLeaf* build_left_most(Match& m) noexcept;
+
+
+			/// @brief Returns an aligned MediumChunkHeader based on provided one and alignment value.
+			MediumChunkHeader* align_header(MediumChunkHeader* h, unsigned align, PageRunHeader* parent) noexcept;
+
+			/// @brief Allocate memory from given match
+			void* allocate_elems_from_match(unsigned elems, Match& m, unsigned align, PageRunHeader* parent) noexcept;
+
+
+		public:
+			static_assert(sizeof(MediumChunkHeader) == MICRO_HEADER_SIZE, "");
+
+			/// @brief Construct the radix tree from its parent arena
+			ALLOCATOR_INLINE RadixTree(BaseArena* a) noexcept
+				:arena(a)
+			{
+				memset((void*)data, 0, sizeof(data));
+			}
+			MICRO_DELETE_COPY(RadixTree)
+
+			/// @brief Find a small free chunk of given size.
+			/// On success, returns true and lock the corresponding entry.
+			ALLOCATOR_INLINE bool find_small_locked(size_t bytes, unsigned elems, Match & m) noexcept
+			{
+				// We are limited by the maximum free block size the left most leaf can store
+				if (bytes > RadixAccess<>::max_small_size)
+					return false;
+
+				// Check in the fastest possible way if this radix tree has a small free chunk available.
+				// Small free chunks might be created by successive allocations/deallocations.
+				RadixLeaf* lmost = left_most.load(std::memory_order_relaxed);
+				if (!lmost && !(lmost = build_left_most(m)))
+					return false;
+
+				unsigned idx = RadixAccess<>::radix_2(elems);
+				// We only consider the first 32 bits of the mask (to reach 512 bytes).
+				// Indead, we don't want bigger free chunks to be considered in order to favor the small objects memory pool.
+				while (auto mask_ = ((lmost->mask.load(std::memory_order_relaxed)) >> idx)) {
+					m.index2 = RadixAccess<>::index_2(mask_) + (std::uint16_t)idx;
+					lmost->locks[m.index2].lock();
+					if (MICRO_LIKELY(lmost->data[m.index2])) {
+						m.ch = lmost;
+						return true;
+					}
+					lmost->locks[m.index2].unlock();
+				}
+				return false;
+			}
+
+			/// @brief Returns the biggest available free chunk size in bytes.
+			/// Used for debug purpose only.
+			size_t max_available_size() noexcept
+			{
+				typename RadixAccess<>::l0_type mask0;
+				typename RadixAccess<>::l1_type mask1;
+				typename RadixAccess<>::l2_type mask2;
+				Match m;
+
+				mask0 = this->mask.load(std::memory_order_relaxed);
+				if (MICRO_UNLIKELY(!mask0))
+					return 0;
+				m.index0 = RadixAccess<>::index_0(mask0);
+				m.l1 = this->get(m.index0);
+				if (MICRO_UNLIKELY(!m.l1))
+					return 0;
+
+				mask1 = m.l1->mask.load(std::memory_order_relaxed);
+				if (!mask1)
+					return 0;
+
+				m.index1 = RadixAccess<>::index_1(mask1);
+				m.ch = m.l1->get(m.index1);
+				mask2 = m.ch->mask.load(std::memory_order_relaxed);
+				if (!mask2) {
+					return 0;
+				}
+				m.index2 = RadixAccess<>::index_2(mask2);
+				std::lock_guard<spinlock> ll(m.ch->locks[m.index2]);
+				return m.ch->data[m.index2] ? m.ch->data[m.index2]->elems * 16 : 0;
+			}
+
+			/// @brief Allocate elems*16 bytes with given alignment (up to page size).
+			/// If provided match is valid, use it for allocation if possible. In this case, the 
+			/// correspondig entry must be locked.
+			/// If force is true, allocate new pages to fullfill the request.
+			/// Returns null on failure.
+			void* allocate_elems(unsigned elems, Match& m, unsigned align ,  bool force ) noexcept;
+
+			/// @brief Deallocate memory previously allocated with allocate_elems().
+			/// Returns the deallocated block size in bytes.
+			unsigned deallocate(void* ptr) noexcept;
+		};
+
+
+
+
+		/// @brief Arena class.
+		///
+		/// A memory manager can contain at most MICRO_MAX_ARENAS arenas.
+		/// The maximum number of arenas is given as a parameter of the
+		/// parent memory manager constructor.
+		/// 
+		/// The arena contains a radix tree to fullfill medium allocations
+		/// (up to 1MB for 64 bits plateforms), and a TinyMemPool
+		/// potentially used for small allocations (depending on the 
+		/// memory manager parameters).
+		/// 
+		/// Each thread is attached to a specific arena.
+		/// 
+		class MICRO_EXPORT_CLASS Arena : public BaseArena
+		{
+			RadixTree radix_tree;	// radix tree
+			TinyMemPool pool;		// small object pool
+		public:
+
+			Arena(BaseMemoryManager* p) noexcept
+				:BaseArena(p,&pool), radix_tree(this), pool(p,&radix_tree){
+			}
+			MICRO_DELETE_COPY(Arena)
+			ALLOCATOR_INLINE RadixTree* tree() noexcept {return &radix_tree;}
+			ALLOCATOR_INLINE TinyMemPool* tiny_pool() noexcept { return &pool; }
+		};
+
+
+
+		/// @brief Memory block used by MemPool, uses bump allocation
+		class MICRO_EXPORT_CLASS MemBlock
+		{
+		public:
+			const unsigned block_size;	// full size of the block
+			unsigned tail;				// tail position for new allcoations
+
+			MemBlock(unsigned bsize) noexcept
+				:block_size(bsize), tail(sizeof(MemBlock))
+			{}
+
+			ALLOCATOR_INLINE void* allocate(unsigned size) noexcept
+			{
+				unsigned end = tail + size;
+				if (end > block_size)
+					return nullptr;
+				void* r = (char*)this + tail;
+				tail = end;
+				return r;
+			}
+		};
+
+
+		/// @brief Thread safe memory pool for allocation only.
+		/// Used to allocate radix tree leaves, allocate recursion detection hash table and page map.
+		class MICRO_EXPORT_CLASS MemPool : public BaseMemPool
+		{
+			spinlock lock;					// lock
+			MemBlock* last{ nullptr };		// last MemBlock
+
+			MemBlock* allocate_block(unsigned size) noexcept
+			{
+				// The maximum requested size is in between 8192 * 2 (recursion detection + page map) and required size to store arenas
+				size_t max_size = 8192 * 2;
+				if (sizeof(Arena) * manager()->params().max_arenas > max_size)
+					max_size = sizeof(Arena) * manager()->params().max_arenas;
+				max_size += sizeof(PageRunHeader);
+				if (max_size % manager()->allocation_granularity())
+					max_size = (max_size / manager()->allocation_granularity() + 1) * manager()->allocation_granularity();
+				size_t pages = (max_size / manager()->page_size()) * 2;
+					
+				// no free block, create new one
+				if (size) { MICRO_ASSERT(size <= (max_size - sizeof(PageRunHeader)), ""); }
+				PageRunHeader* p = manager()->allocate_pages(pages);
+				if (MICRO_UNLIKELY(!p)) {
+					return nullptr;
+				}
+				p->arena = manager();
+
+				// Create MemBlock
+				MemBlock* block = (MemBlock*)(p + 1);
+				new (block) MemBlock((unsigned)(p->run_size() - sizeof(PageRunHeader)));
+				return block;
+			}
+
+		public:
+			/// @brief Construct from a parent arena and element size in bytes
+			MemPool(BaseMemoryManager* m) noexcept
+				:BaseMemPool(m)
+			{}
+
+			/// @brief Allocate size bytes
+			ALLOCATOR_INLINE void* allocate(unsigned size) noexcept override
+			{
+				std::lock_guard<spinlock> ll(lock);
+				void* r = last ? last->allocate(size) : nullptr;
+				if (!r) {
+					if (!(last = allocate_block(size)))
+						return nullptr;
+					r = last->allocate(size);
+				}
+				return r;
+			}
+		};
+
+
+		
+		/// @brief Recusrion detection class.
+		///
+		/// When overriding the malloc/free functions, the 
+		/// malloc function might enter in infinite recursion
+		/// if it triggers another malloc call.
+		/// 
+		/// This might be the case when printing information or
+		/// logging statistics to a file.
+		/// 
+		/// DetectRecursion class is used to detect such recursions
+		/// in order to satify recursive allocations through a
+		/// different path.
+		/// 
+		/// DetectRecursion is basically a hash map of thread id
+		/// with no probing strategy. Indeed, we must ensure that
+		/// all recursions are detected, but we don't really care 
+		/// if a non recursice scenario is detected as such, as long
+		/// as this rarely happen.
+		/// 
+		class MICRO_EXPORT_CLASS DetectRecursion
+		{
+		public:
+			using Key = std::atomic<bool>;
+			
+		private:
+			Key* keys{ nullptr };
+			unsigned capacity{ 0 };
+
+		public:
+			struct KeyHolder
+			{
+				Key* k;
+				ALLOCATOR_INLINE operator const void* () const noexcept { return k; }
+				ALLOCATOR_INLINE ~KeyHolder() noexcept {
+					if(k) k->store(false, std::memory_order_relaxed);
+				}
+			};
+
+			/// @brief Initialize from a memory block of power of 2 capacity
+			void init(void* p, unsigned c) noexcept {
+				keys = ((Key*)p);
+				capacity = (c / sizeof(Key));
+			}
+
+			/// @brief Returns a Key * if the value was successfully inserted,
+			/// null if the value already exists.
+			ALLOCATOR_INLINE Key* insert(std::uint32_t hash) noexcept
+			{
+				auto* k = keys + (hash & (capacity - 1u));
+				if (!k->load(std::memory_order_relaxed) && !k->exchange(true, std::memory_order_acquire))
+					return k;
+				return nullptr;
+			}
+			/// @brief Erase entry
+			ALLOCATOR_INLINE void erase(Key* k) noexcept
+			{
+				k->store(false, std::memory_order_relaxed);
+			}
+		};
+
+		
+		/// @brief Memory manager class
+		///
+		/// MemoryManager is the main class for memory allocation/deallocation.
+		/// A MemoryManager object manages a collection of pages (retrieved from
+		/// OS calls, from a memory chunk or from a file depending on the page
+		/// provider) and distribute them among arenas.
+		/// 
+		/// Each arena handles allocations for specific threads in order to avoid
+		/// contentions. An arena can serve allocations up to 1MB.
+		/// 
+		/// Big allocations (above 1MB) are directly served using the underlying page provider.
+		/// 
+		/// On destruction, a MemoryManager object will deallocate all remaining 
+		/// allocated memory. 
+		/// 
+		/// You should use the public class micro::heap to manage allocations
+		/// instead of MemoryManager.
+		/// 
+		class MICRO_EXPORT_CLASS MemoryManager : public BaseMemoryManager
+		{
+		public:
+			using block_pool_type = typename TinyMemPool::block;
+
+		private:
+			friend struct TinyMemPool;
+
+			/// @brief MemPool proxy class, just to call the constructor on demand
+			struct alignas(MemPool) MemPoolProxy
+			{
+				char data[sizeof(MemPool)];
+				ALLOCATOR_INLINE MemPool* as_mem_pool() noexcept {
+					return reinterpret_cast<MemPool*>(data);
+				}
+			};
+			/// @brief Arena proxy class, just to call the constructor on demand
+			struct alignas(Arena) ArenaProxy
+			{
+				char data[sizeof(Arena)];
+				ALLOCATOR_INLINE Arena* arena() noexcept {
+					return (Arena*)data;
+				}
+			};
+
+			
+			using lock_type = recursive_spinlock;
+			lock_type lock;							// Recursive lock used to protect pages manipulations
+			PageRunHeader end;						// Linked list of ALL page runs
+			PageRunHeader end_free;		// Buffer of pages
+			size_t free_page_count{ 0 };
+
+
+			const unsigned os_psize;				// used page size (from page provider)
+			const unsigned os_psize_bits;			// page size bits
+			const unsigned os_alloc_granularity;	// allocation granularity (from page provider)
+			const unsigned os_max_medium_pages;		// maximum page count for the radix tree
+			const unsigned os_max_medium_size;		// maximum size before big allocations (direct calls to the page provider)
+			std::atomic <std::clock_t> start_time;	// object start time (for statistics)
+
+			std::atomic<size_t> used_pages{ 0 };	// Total pages currently in use
+			std::atomic<size_t> used_spans{ 0 };	// Total page runs (or PageRunHeader) currently in use
+			std::atomic<size_t> max_pages{ 0 };		// Maximum used pages (or memory peak)
+
+#if MICRO_THREAD_LOCAL_NO_ALLOC == 0
+			DetectRecursion detect_recurs;			// recursion detection
+#endif
+			PageMap page_map;						// page map, sorted array of ALL PageRunHeader currently in use
+
+			// memory pools for radix tree
+			MemPoolProxy radix_pool;				// memory pool mainly used for radix tree allocation
+
+			FILE* continuous{ nullptr };					// continuous statistics output
+			FILE* stats_output{ nullptr };					// on exit statistics output
+			std::atomic<bool> on_exit_done{ false };		// exit operations performed (or not)
+			std::atomic<bool> init_done{false};				// initialization operations performed (or not)
+			std::atomic<bool> header_printed{ false };		// CSV statistics header printed (or not)
+
+			std::atomic<std::uint64_t> last_bytes{ 0 };		// last allocated bytes, used to trigger stats print
+			std::atomic<double> last_time{ 0 };				// last allocation time, used to trigger stats print
+
+			ArenaProxy* arenas{ nullptr };					// array of arenas
+
+			/// @brief Initialize the arenas
+			bool initialize_arenas() noexcept;
+			/// @brief Compute the maximum number of pages for the radix tree
+			unsigned compute_max_medium_pages() const noexcept;
+			/// @brief Compute the allocation size limit before big allocations
+			unsigned compute_max_medium_size() const noexcept;
+
+			ALLOCATOR_INLINE unsigned max_medium_pages() const noexcept{return os_max_medium_pages;}
+			ALLOCATOR_INLINE unsigned max_medium_size() const noexcept{return os_max_medium_size;}
+			ALLOCATOR_INLINE Arena* get_arenas() noexcept{return arenas[0].arena();}
+
+			/// @brief Returns current thread arena index.
+			/// Note that a thread will have the same index in all MemoryManager instances.
+			ALLOCATOR_INLINE unsigned thread_idx() noexcept
+			{
+				static std::atomic<std::uint16_t> counter{ 0 };
+				static thread_local unsigned idx = counter++;
+				return idx;
+			}
+			/// @brief Returns the arena used to allocate memory in current thread
+			ALLOCATOR_INLINE Arena* select_arena() noexcept
+			{
+				// All MemoryManager share the same arena idx for a specific thread
+				return arenas[thread_idx() & (params().max_arenas - 1u)].arena();
+			}
+			
+			
+			void print_os_infos(logger::print_callback_type callback, void* opaque)const noexcept;
+			void print_exit_infos(logger::print_callback_type callback, void* opaque)const noexcept;
+			void record_stats(void* p) noexcept;
+			void record_stats(void* p, int status) noexcept;
+			void print_stats_if_necessary(bool force = false) noexcept;
+			void init_internal() noexcept;
+			void* allocate_big(size_t bytes) noexcept;
+			void* allocate_big_path(size_t bytes, bool stats) noexcept;
+			void* allocate_in_other_arenas(unsigned elems, unsigned align, Arena * first) noexcept;
+			void* allocate_recursive(Match& m, unsigned elems) noexcept;
+			static void deallocate(void* p, bool stats) noexcept;
+			
+			static int type_of_maybe_small(SmallChunkHeader* tiny, TinyMemPoolHeader* h, block_pool_type* pool, void* p) noexcept;
+			//static int type_of(void* p, block_pool_type** block_pool = nullptr, BaseMemoryManager** memory_mgr = nullptr) noexcept;
+			static MemoryManager* find_from_page_run(PageRunHeader*) noexcept;
+
+			static MICRO_ALWAYS_INLINE int type_of(void* p, block_pool_type** block_pool = nullptr, BaseMemoryManager** memory_mgr = nullptr) noexcept
+			{
+				// Returns the pointer type, considering it is already a valid block allocated by a MemoryManager object.
+				// For MICRO_ALLOC_SMALL_BLOCK only, fill block_pool and memory_mgr if not null.
+
+				SmallChunkHeader* tiny = (SmallChunkHeader*)((char*)p - 8);
+				uintptr_t aligned = (uintptr_t)p & ~(MICRO_ALIGNED_POOL - 1ull);
+				TinyMemPoolHeader* h = (TinyMemPoolHeader*)aligned;
+				
+				if (h != p && h->guard == MICRO_BLOCK_GUARD && h->status == MICRO_ALLOC_SMALL_BLOCK) {
+
+					block_pool_type* pool = (block_pool_type*)((std::uint64_t*)h - h->offset_block);
+					int ret = MICRO_ALLOC_SMALL_BLOCK;
+					if (MICRO_UNLIKELY(tiny->guard == MICRO_BLOCK_GUARD && (tiny->status == MICRO_ALLOC_MEDIUM ||
+						tiny->status == MICRO_ALLOC_SMALL || tiny->status == MICRO_ALLOC_BIG))) {
+						ret = type_of_maybe_small(tiny, h, pool, p);
+					}
+					if (ret == MICRO_ALLOC_SMALL_BLOCK && block_pool) {
+						*block_pool = pool;
+						*memory_mgr = pool->mgr;//h->mgr;
+					}
+					return ret;
+				}
+				return tiny->status;
+			}
+
+		public:
+			/// @brief Construct from parameters, but do not initialize the manager (to avoid triggering a potential allocation)
+			MemoryManager(const parameters & p, bool) noexcept;
+			/// @brief Construct from parameters and initialize
+			MemoryManager(const parameters & p) noexcept;
+			/// @brief destructor, deallocate all remainign memory
+			~MemoryManager() noexcept override;
+
+			/// @brief Initialize the memory manager
+			ALLOCATOR_INLINE void init() noexcept {
+				if(MICRO_UNLIKELY(!init_done.load(std::memory_order_relaxed)))
+					if(!init_done.exchange(true))
+						init_internal();
+			}
+
+			/// @brief Clear the memory manager
+			virtual void clear() noexcept override;
+
+			virtual PageRunHeader* allocate_pages(size_t page_count) noexcept override;
+			virtual PageRunHeader* allocate_medium_block() noexcept override;
+			virtual PageRunHeader* allocate_pages_for_bytes(size_t bytes) noexcept override;
+			virtual void deallocate_pages(PageRunHeader* p) noexcept override;
+			
+			virtual void* allocate_no_tiny_pool(size_t bytes, size_t minimum_bytes, unsigned align) noexcept override;
+			virtual void deallocate_no_tiny_pool(void*) noexcept override;
+			virtual void* allocate_and_forget(unsigned size) noexcept override;
+
+			unsigned maximum_medium_size() const noexcept { return max_medium_size(); }
+			void* allocate(size_t bytes, unsigned align = 0) noexcept;
+			void* aligned_allocate(size_t alignment, size_t size) noexcept;
+			static void deallocate(void* p, int status, block_pool_type* pool, BaseMemoryManager* mgr, bool stats) noexcept;
+			static void deallocate(void* p) noexcept;
+			static size_t usable_size(void* p) noexcept;
+			static size_t usable_size(void* p, int status) noexcept;
+			static int type_of_safe(void* p, block_pool_type** block_pool = nullptr, BaseMemoryManager** memory_mgr = nullptr) noexcept;
+
+			void reset_statistics() noexcept;
+			void set_start_time();
+
+			void dump_statistics(micro_statistics& stats) noexcept;
+
+			std::uint64_t peak_allocated_memory() const noexcept {
+				return max_pages.load() * this->provider.page_size();
+			}
+
+			void print_stats_header(logger::print_callback_type callback, void* opaque)noexcept;
+			void print_stats_header_stdout()noexcept;
+
+			void print_stats_row(logger::print_callback_type callback, void* opaque)noexcept;
+			void print_stats_row_stdout()noexcept;
+
+			void print_stats(logger::print_callback_type callback, void* opaque) noexcept;
+			void print_stats_stdout() noexcept;
+
+			void perform_exit_operations() noexcept;
+		};
+	}
+}
+
+
+
+#ifdef MICRO_HEADER_ONLY
+#include "allocator.cpp"
+#endif
+
+#ifdef _MSC_VER
+#pragma warning( pop )
+#endif
+
+MICRO_POP_DISABLE_OLD_STYLE_CAST
+
+#endif

@@ -1,0 +1,1491 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2024 Victor Moncada <vtr.moncada@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+
+
+
+#include <atomic>
+#include <map>
+#include <functional>
+#include <cstdlib>
+#include <cinttypes>
+
+
+#include "../logger.hpp"
+#include "../os_page.hpp"
+#include "../os_timer.hpp" 
+#include "../parameters.hpp"
+#include "allocator.hpp"
+
+MICRO_PUSH_DISABLE_OLD_STYLE_CAST
+
+#if defined( _MSC_VER ) || defined(__MINGW32__)
+#include "Windows.h"
+#endif
+
+#ifdef min
+#undef min
+#undef max
+#undef small
+#endif
+
+namespace micro
+{
+	
+	namespace detail
+	{
+		static inline void alloc_callback_std(void* p, const char* str)
+		{
+			using std_type = decltype(stdout);
+			if (stdout == (std_type)p)
+				MICRO_WARN_FORMAT(printf(str))
+			else
+				MICRO_WARN_FORMAT(fprintf(stderr, str))
+		}
+
+		static inline void alloc_callback_file(void* p, const char* str)
+		{
+			FILE* f = (FILE*)p;
+			fwrite( str, strlen(str),1,f);
+		}
+
+
+
+
+		
+		MICRO_EXPORT_CLASS_MEMBER RadixLeaf* RadixLevel1::alloc(unsigned pos) noexcept
+		{
+			RadixLeaf* l = nullptr;
+			RadixLeaf* tmp = (RadixLeaf*)mgr->allocate_and_forget(sizeof(RadixLeaf));
+			if (MICRO_UNLIKELY(!tmp))
+				return nullptr;
+			new (tmp) RadixLeaf();
+			tmp->parent = this;
+			tmp->parent_index = pos;
+			if (MICRO_LIKELY(data[pos].compare_exchange_strong(l, tmp)))
+				return tmp;
+			MICRO_ASSERT_DEBUG(tmp->mask == 0,"");
+			return l;
+		}
+
+
+
+		MICRO_EXPORT_CLASS_MEMBER RadixLevel1* RadixTree::alloc(unsigned pos) noexcept
+		{
+			RadixLevel1* l = nullptr;
+			RadixLevel1* tmp = (RadixLevel1*)arena->manager()->allocate_and_forget(sizeof(RadixLevel1));//(RadixLevel1*)l1_pool.allocate(nullptr);
+			if (MICRO_UNLIKELY(!tmp))
+				return nullptr;
+			new (tmp)RadixLevel1;
+			tmp->parent_index = pos;
+			tmp->mgr = arena->manager();
+			if (MICRO_LIKELY(data[pos].compare_exchange_strong(l, tmp)))
+				return tmp;
+			return l;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void RadixTree::invalidate_masks(RadixLeaf* ch) noexcept
+		{
+			RadixLevel1* l1 = ch->parent;
+
+			// update l1 mask
+			while (ch->mask == 0) {
+				// leaf has null mask: invalidate mask in l1
+				l1->mask.fetch_and(~((typename RadixAccess<>::l1_type)1 << ch->parent_index));
+				if (MICRO_UNLIKELY(ch->mask != 0)) {
+					// leaf mask just changed: cancel invalidation!
+					l1->mask.fetch_or(((typename RadixAccess<>::l1_type)1 << ch->parent_index));
+					continue;
+				}
+				else
+					break;
+			}
+
+			// update root mask
+			while (l1->mask == 0) {
+				this->mask.fetch_and(~((typename RadixAccess<>::l0_type)1 << l1->parent_index));
+				if (MICRO_UNLIKELY(l1->mask != 0)) {
+					// leaf mask just changed: cancel invalidation!
+					this->mask.fetch_or(((typename RadixAccess<>::l0_type)1 << l1->parent_index));
+					continue;
+				}
+				else
+					break;
+			}
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER bool RadixTree::add_new() noexcept
+		{
+			// no valid block found: allocate one
+			PageRunHeader* block = this->arena->manager()->allocate_medium_block();
+			if (MICRO_UNLIKELY(!block))
+				return false;
+
+			block->arena = this->arena;
+
+			MediumChunkHeader* h = (MediumChunkHeader*)((char*)block + sizeof(PageRunHeader));
+			new (h) MediumChunkHeader();
+			h->elems = (unsigned)( (block->size_bytes - sizeof(PageRunHeader) - sizeof(MediumChunkHeader)) >> MICRO_ELEM_SHIFT);
+			h->th.offset_bytes = sizeof(PageRunHeader) >> MICRO_ELEM_SHIFT;
+			h->th.status = MICRO_ALLOC_FREE;
+			h->offset_prev = 0;
+
+			Match m;
+			insert_free(h, m);
+			return true;
+		}
+		
+		
+		MICRO_EXPORT_CLASS_MEMBER RadixLeaf* RadixTree::build_left_most(Match& m) noexcept 
+		{
+			if (mask & 1) {
+				RadixLevel1* l1 = get(0);
+				if (MICRO_UNLIKELY(!l1))
+					return nullptr;
+				if (l1->mask & 1) {
+					RadixLeaf* ch = l1->get(0);
+					if (MICRO_LIKELY(ch)) {
+						m.l1 = l1;
+						left_most.store(ch);
+						return ch;
+					}
+				}
+			}
+			return nullptr;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER MediumChunkHeader* RadixTree::align_header(MediumChunkHeader * h, unsigned align, PageRunHeader* parent) noexcept
+		{
+			uintptr_t addr = (uintptr_t)(h + 1);
+			if ((addr & (align - 1)) != 0) {
+				// unaligned address
+				addr = addr & ~((uintptr_t)(align-1));
+				addr += align;
+				if (addr == (uintptr_t)(h + 2)) {
+					// 16 bytes after h data start: that would leave a header without data
+					addr += align;
+				}
+
+				MediumChunkHeader* new_h = (MediumChunkHeader*)addr - 1;
+
+				// create left chunk
+				unsigned h_elems = h->elems;
+				MediumChunkHeader* new_free = h;
+				new (new_free) MediumChunkHeader(
+					h->offset_prev,
+					(unsigned)((new_h - new_free) - 1),
+					MICRO_ALLOC_FREE,
+					(unsigned)(((char*)new_free - (char*)parent) >> MICRO_ELEM_SHIFT));
+
+				// update h
+				h = new (new_h) MediumChunkHeader(new_free->elems + 1, h_elems - (new_free->elems + 1),
+					MICRO_ALLOC_FREE,
+					(unsigned)(((char*)new_h - (char*)parent) >> MICRO_ELEM_SHIFT));
+
+				// update next chunk prev offset
+				MediumChunkHeader* next = h + h->elems + 1;
+				if (next < (MediumChunkHeader*)parent->end()) {
+					next->offset_prev = (unsigned)(next - h);
+					MICRO_ASSERT_DEBUG(check_prev_next(next), "");
+				}
+
+				MICRO_ASSERT_DEBUG(check_prev_next(new_free), "");
+				MICRO_ASSERT_DEBUG(check_prev_next(h), "");
+
+				// insert
+				Match m;
+				insert_free(new_free, m);
+			}
+			MICRO_ASSERT_DEBUG((uintptr_t)(h+1) % align == 0, "");
+			return h;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* RadixTree::allocate_elems_from_match(unsigned elems, Match& m, unsigned align, PageRunHeader* parent) noexcept
+		{
+			// We found one!
+			MICRO_ASSERT_DEBUG(check_prev_next(m.ch->data[m.index2]), "");
+
+			RadixLeaf* save = m.ch;
+
+			// Remove chunk
+			MediumChunkHeader* h = remove_free_link(m);
+
+			MICRO_ASSERT(h->th.status == MICRO_ALLOC_FREE, ""); 
+			MICRO_ASSERT(h->th.guard == MICRO_BLOCK_GUARD, "");
+
+			// invalidate mask if necessary
+			if (!m.ch->data[m.index2])
+				m.ch->mask.fetch_and(~(1ull << m.index2));
+			m.ch->locks[m.index2].unlock();
+
+			if (align > 16) 
+				h = align_header(h, align, parent);
+			
+
+			//unsigned elems_1 = elems + 1;
+			if (MICRO_LIKELY(h->elems > elems + 1)) {
+
+				// we can carve a free block out of this one
+				MediumChunkHeader* new_free = split_chunk(h, parent, elems + 1);
+				MICRO_ASSERT_DEBUG(new_free->parent() == h->parent(), "");
+				MICRO_ASSERT_DEBUG(check_prev_next(new_free), "");
+				
+				//TODO: might throw!
+				insert_free(new_free, m);
+			}
+
+			if (MICRO_UNLIKELY(save->mask.load(std::memory_order_relaxed) == 0)) 
+				// invalidate mask
+				invalidate_masks(save);
+
+			MICRO_ASSERT_DEBUG(parent->left != nullptr, "");
+			MICRO_ASSERT_DEBUG(parent->right != nullptr, "");
+
+			h->th.status = MICRO_ALLOC_MEDIUM;
+			return h + 1;
+		}
+
+
+		MICRO_EXPORT_CLASS_MEMBER void* RadixTree::allocate_elems(unsigned elems, Match& m, unsigned align, bool force) noexcept
+		{
+			PageRunHeader* parent = nullptr;
+			unsigned search_for = elems;
+			if (align > 16) {
+				MICRO_ASSERT_DEBUG((align & (align-1)) == 0, "");
+				search_for += align / 16u + 1u ;
+			}
+
+			if (m.ch)
+				goto found;
+
+			for (;;) {
+				// Find a valid chunk and lock it
+				m.ch = lower_bound_lock(search_for, m);
+
+				if (MICRO_UNLIKELY(!m.ch)) {
+					if (!force) return nullptr;
+					if (MICRO_UNLIKELY(!add_new())) return nullptr;
+					continue;
+				}
+				
+found:
+				parent = m.ch->data[m.index2]->parent();
+
+				if (MICRO_LIKELY(parent->lock.try_lock_shared())) {
+					MICRO_ASSERT_DEBUG(check_prev_next(m.ch->data[m.index2]), "");
+					MICRO_ASSERT_DEBUG(parent->left != nullptr, "");
+					MICRO_ASSERT_DEBUG(parent->right != nullptr, "");
+					void * r = this->allocate_elems_from_match(elems, m, align, parent);
+					parent->lock.unlock_shared();
+					return r;
+				}
+
+				m.ch->locks[m.index2].unlock();
+				m.ch = nullptr;
+				std::this_thread::yield();
+			}
+			MICRO_UNREACHABLE();
+		}
+		
+
+		MICRO_EXPORT_CLASS_MEMBER unsigned RadixTree::deallocate(void* ptr) noexcept
+		{
+			MediumChunkHeader* f = (MediumChunkHeader*)ptr - 1;
+			PageRunHeader* parent = f->parent();
+			MediumChunkHeader* n = f + f->elems + 1; 
+			MediumChunkHeader* end = (MediumChunkHeader*)parent->end();
+			unsigned bytes = f->elems << MICRO_ELEM_SHIFT;
+
+			MICRO_ASSERT_DEBUG(f->th.guard == MICRO_BLOCK_GUARD, "");
+			MICRO_ASSERT_DEBUG(f->th.status == MICRO_ALLOC_MEDIUM, "");
+
+
+			parent->lock.lock();
+
+			MICRO_ASSERT_DEBUG(parent->left != nullptr, "");
+			MICRO_ASSERT_DEBUG(parent->right != nullptr, "");
+			MICRO_ASSERT_DEBUG(check_prev_next(f), "");
+
+			MediumChunkHeader* p = f - f->offset_prev;
+
+			//MICRO_PREFETCH(p);
+			//MICRO_PREFETCH(n);
+
+			if (p->th.status == MICRO_ALLOC_FREE ) {
+				MICRO_ASSERT_DEBUG(p != f, "");
+				f = merge_previous(p, f, n, end);
+			}
+			if (n < end && n->th.status == MICRO_ALLOC_FREE ) {
+				MICRO_ASSERT_DEBUG(n->elems != 0, "");
+				f = merge_next(p, f, n, end);
+			}
+
+			// Deallocate memory block if needed
+			if (MICRO_UNLIKELY(((f->block_bytes() + sizeof(PageRunHeader) == parent->size_bytes)))) {
+				MICRO_ASSERT_DEBUG((void*)f == (void*)(parent + 1), "");
+
+				parent->lock.unlock();
+				this->arena->manager()->deallocate_pages(parent);
+				
+			}
+			else {
+				f->th.status = MICRO_ALLOC_FREE;
+				// add to radix tree
+				Match m;
+				insert_free(f, m);
+				MICRO_ASSERT_DEBUG(check_prev_next(f), "");
+				MICRO_ASSERT_DEBUG(parent->left != nullptr, "");
+				MICRO_ASSERT_DEBUG(parent->right != nullptr, "");
+
+				parent->lock.unlock();
+			}
+			return bytes;
+		}
+
+
+
+		template<class Lock>
+		struct UnlockGuard
+		{
+			Lock* l;
+			UnlockGuard(Lock& _l) noexcept
+				:l(&_l) {
+				l->unlock();
+			}
+			~UnlockGuard() noexcept {
+				l->lock();
+			}
+		};
+
+		/*MICRO_EXPORT_CLASS_MEMBER size_t RadixTree::debug_count_free_bytes() noexcept
+		{
+			size_t r = 0;
+			for (unsigned i = 0; i < sizeof(this->mask) * 8; ++i) {
+				if(auto* l1 = data[i].load()){
+					for (unsigned j = 0; j < sizeof(l1->mask) * 8; ++j) {
+						if (auto* leaf = l1->data[j].load()) {
+							for (unsigned k = 0; k < sizeof(leaf->mask) * 8; ++k) {
+								std::unique_lock<lock_type> ll(leaf->locks[k]);
+								MediumChunkHeader* h = leaf->data[k];
+								while (h) {
+									r += h->elems << MICRO_ELEM_SHIFT;
+									h = h->next();
+								}
+							}
+						}
+					}
+				}
+			}
+			return r;
+		}*/
+
+		MICRO_EXPORT_CLASS_MEMBER bool MemoryManager::initialize_arenas() noexcept
+		{
+			std::lock_guard<lock_type> ll(lock);
+			if (!arenas) {
+
+				// Initialize global memory pool that will be used to perform following allocations
+				new (&radix_pool) MemPool(this);
+
+				// Allocate arenas
+				size_t arenas_bytes = (sizeof(ArenaProxy) * params().max_arenas + sizeof(PageRunHeader));
+				void* a = allocate_and_forget((unsigned)arenas_bytes);
+				if (!a) 
+					return false;
+
+				// Allocate buffer for recursion detection
+#if MICRO_THREAD_LOCAL_NO_ALLOC == 0
+				unsigned r_bytes = 4096 * 2;
+				void *r = allocate_and_forget(r_bytes);
+				if (!r) {
+					clear(); //make sure to deallocate pages allocated for arenas
+					return false;
+				}
+#endif
+
+				// Initialize arenas
+				ArenaProxy* _arenas = (ArenaProxy*)(a);
+				for (unsigned i = 0; i < params().max_arenas; ++i)
+					new (_arenas[i].arena()) Arena(this);
+
+#if MICRO_THREAD_LOCAL_NO_ALLOC == 0
+				memset(r, 0, r_bytes);
+				detect_recurs.init(r, r_bytes);
+#endif
+				// Initialize arenas at the end to avoid other threads to go further
+				arenas = _arenas;
+			}
+			return true;
+
+
+			/*std::lock_guard<spinlock> ll(lock);
+			if (!arenas) {
+				size_t arenas_bytes = (sizeof(ArenaProxy) * params().max_arenas + sizeof(PageRunHeader));
+				size_t pcount = arenas_bytes / os_psize + (arenas_bytes % os_psize ? 1 : 0);
+				if (pcount == 0)
+					pcount = 1;
+				if (page_provider()->allocation_granularity() > page_provider()->page_size()) {
+					size_t granularity_pcount = page_provider()->allocation_granularity() / page_provider()->page_size();
+					if (granularity_pcount > pcount)
+						pcount = granularity_pcount;
+				}
+					
+				auto *run = (PageRunHeader*)page_provider()->allocate_pages(pcount);
+				if (!run) return false;
+				run->size_bytes = pcount << os_psize_bits;
+				run->insert(&end);
+				ArenaProxy * _arenas = (ArenaProxy*)(run + 1);
+
+				new (&radix_pool) MemPool(_arenas[0].arena(), 16);
+				for (unsigned i = 0; i < params().max_arenas; ++i)
+					new (_arenas[i].arena()) Arena(this);
+
+#if MICRO_THREAD_LOCAL_NO_ALLOC == 0
+				void* th_run = nullptr;
+				size_t bytes = 0;
+				if (run->size_bytes - arenas_bytes > page_provider()->page_size()) {
+					pcount = (run->size_bytes - arenas_bytes) / page_provider()->page_size();
+					if (pcount & (pcount - 1)) {
+						// we need a power of 2  number of pages for the hash table
+						pcount = 1ull << bit_scan_reverse_64(pcount);
+					}
+					
+					bytes = pcount * page_provider()->page_size();
+					th_run = (char*)run + run->size_bytes - bytes;
+				}
+				else {
+					pcount = 1;
+					if (page_provider()->allocation_granularity() > page_provider()->page_size()) 
+						pcount = page_provider()->allocation_granularity() / page_provider()->page_size();
+
+					auto* run = (PageRunHeader*)page_provider()->allocate_pages(pcount);
+					if (!run) return false;
+					run->size_bytes = pcount << os_psize_bits;
+					run->insert(&end);
+
+					bytes = run->size_bytes - sizeof(PageRunHeader);
+					// we need a power of 2  number of pages for the hash table
+					bytes = 1ull << bit_scan_reverse_64(bytes);
+					th_run = run + 1;
+				}
+				memset(th_run, 0, bytes);
+				detect_recurs.init(th_run, (unsigned)bytes);
+#endif
+				// Initialize arenas at the end to avoid other threads to go further
+				arenas = _arenas;
+			}
+			return true;*/
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER unsigned MemoryManager::compute_max_medium_pages() const noexcept
+		{
+			return (unsigned)(MICRO_BLOCK_SIZE / page_provider()->page_size());
+
+			// Old version: keep it for now
+			/*unsigned max_bytes = (MICRO_MAX_RADIX_ELEMS)-1u;
+			unsigned max_span_bytes = max_bytes + sizeof(PageRunHeader) + sizeof(MediumChunkHeader);
+			unsigned max_pages_ = max_span_bytes / (unsigned)page_provider()->allocation_granularity(); //>> page_size_bits();
+			if (max_span_bytes & (unsigned)(page_provider()->allocation_granularity() - 1))
+				max_pages_--;
+			if (page_provider()->allocation_granularity() > page_provider()->page_size())
+				max_pages_ *= (unsigned)(page_provider()->allocation_granularity() / page_provider()->page_size());
+			return max_pages_;*/
+		}
+		MICRO_EXPORT_CLASS_MEMBER unsigned MemoryManager::compute_max_medium_size() const noexcept
+		{
+			unsigned max_pages_ = compute_max_medium_pages();
+			return (max_pages_ << page_size_bits()) - (sizeof(PageRunHeader) + sizeof(MediumChunkHeader));
+		}
+
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate_big(size_t bytes) noexcept
+		{
+			size_t requested = bytes + sizeof(PageRunHeader) + sizeof(BigChunkHeader);
+			auto* block = allocate_pages_for_bytes(requested);
+			if (MICRO_UNLIKELY(!block))
+				return nullptr;
+
+			if (!page_map.insert(block, true)) {
+				deallocate_pages(block);
+				return nullptr;
+			}
+
+			BigChunkHeader* h = new (block + 1) BigChunkHeader();
+			h->size = bytes;// allocated - (sizeof(PageRunHeader) + sizeof(BigChunkHeader));
+			h->th.offset_bytes = sizeof(PageRunHeader);
+			h->th.status = MICRO_ALLOC_BIG;
+			return h->th.data();
+		}
+
+		
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats_if_necessary(bool force) noexcept
+		{
+			bool print = force;
+			if (!print) {
+				if (params().print_stats_trigger & MicroOnBytes)
+					if (stats().max_alloc_bytes.load() - last_bytes.load() >= params().print_stats_bytes) {
+						last_bytes.store(stats().max_alloc_bytes.load());
+						print = true;
+					}
+				if (!print && params().print_stats_trigger & MicroOnTime) {
+					double current = std::clock();
+					double el_ms = ((current - last_time.load()) / CLOCKS_PER_SEC) * 1e3;
+					if (el_ms >= params().print_stats_ms) {
+						last_time.store(current);
+						print = true;
+					}
+				}
+			}
+			if (print && stats_output) {
+
+				if (params().print_stats_csv) {
+					if (!header_printed.exchange(true))
+						print_stats_header(alloc_callback_file, (void*)stats_output);
+					print_stats_row(alloc_callback_file, (void*)stats_output);
+				}
+				else {
+					print_stats(alloc_callback_file, (void*)stats_output);
+				}
+			}
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_os_infos(logger::print_callback_type callback, void* opaque)const noexcept
+		{
+			logger::print_direct(callback, opaque, nullptr, "os_page_size\t%u\n", (unsigned)page_size());
+			logger::print_direct(callback, opaque, nullptr, "os_allocation_granularity\t%u\n", (unsigned)page_provider()->allocation_granularity());
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_exit_infos(logger::print_callback_type callback, void* opaque)const noexcept
+		{
+			double elapsed = (double)(std::clock() - start_time.load(std::memory_order_relaxed)) / CLOCKS_PER_SEC;
+			micro_process_infos infos;
+			os_process_infos(infos);
+
+			logger::print_direct(callback, opaque, nullptr, "Peak_RSS\t" MICRO_U64F "\n", (std::uint64_t)infos.peak_rss);
+			logger::print_direct(callback, opaque, nullptr, "Peak_Commit\t" MICRO_U64F "\n", (std::uint64_t)infos.peak_commit);
+			logger::print_direct(callback, opaque, nullptr, "Page_Faults\t" MICRO_U64F "\n", (std::uint64_t)infos.page_faults);
+			logger::print_direct(callback, opaque, nullptr, "Elapsed_Seconds\t%f\n", elapsed);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::init_internal() noexcept
+		{
+
+			const char * f = params().print_stats.data();
+			if (f[0]) {
+				
+				if (strcmp(f, "stdout") == 0) {
+					stats_output = stdout;
+				}
+				else if (strcmp(f, "stderr") == 0) {
+					stats_output = stderr;
+				}
+				else {
+					continuous = fopen(f, "w");
+					if (continuous) 
+						stats_output = continuous;
+					else 
+						logger::print_stderr(MicroWarning, "unable to open log file %s\n", f);
+				}
+				if (stats_output) {
+					setvbuf(stats_output, (char*)nullptr, _IONBF, 0);
+					if(params().print_stats_csv)
+						fprintf(stats_output, "sep=\t\n");
+					print_os_infos(alloc_callback_file, (void*)stats_output);
+					params().print(alloc_callback_file, (void*)stats_output);
+					fprintf(stats_output, "\n");
+					
+				}
+			}
+		}
+
+
+		MICRO_EXPORT_CLASS_MEMBER MemoryManager::MemoryManager(const parameters & p) noexcept
+			: MemoryManager(p,false)
+		{
+			init();
+		}
+		MICRO_EXPORT_CLASS_MEMBER MemoryManager::MemoryManager(const parameters& p, bool) noexcept
+			: BaseMemoryManager(p),
+			os_psize((unsigned)page_provider()->page_size()),
+			os_psize_bits((unsigned)page_provider()->page_size_bits()),
+			os_alloc_granularity((unsigned)page_provider()->allocation_granularity()),
+			os_max_medium_pages(compute_max_medium_pages()),
+			os_max_medium_size(compute_max_medium_size()),
+			start_time(std::clock()),
+			page_map(this)
+		{
+			end.left = end.right = &end;
+			end_free.left_free = end_free.right_free = &end_free;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::perform_exit_operations() noexcept
+		{
+			if (on_exit_done.exchange(true))
+				return;
+			init();
+			// print statistics on exit
+			if (stats_output) {
+				if (params().print_stats_trigger)
+					print_stats_if_necessary(true);
+				print_exit_infos(alloc_callback_file, (void*)stats_output);
+				if (continuous)
+					fclose(continuous);
+			}
+			
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER MemoryManager::~MemoryManager() noexcept
+		{
+			// print statistics on exit
+			perform_exit_operations();
+
+			// clear pages
+			if (page_provider()->own_pages())
+				clear();
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::clear() noexcept
+		{
+			std::unique_lock<lock_type> ll(lock);
+
+			used_pages = 0;
+			used_spans = 0;
+			free_page_count = 0;
+
+			// No-op, keep it in case we add a destructor to Arena, RadixTree or TinyMemPool
+			for (unsigned i = 0; i < params().max_arenas; ++i)
+				get_arenas()[i].~Arena();
+
+
+			// deallocate pages
+			/*PageRunHeader* next = end.right;
+			while (next != &end) {
+				PageRunHeader* p = next;
+				next = next->right;
+				p->~PageRunHeader();
+				page_provider()->deallocate_pages(p, (size_t)(p->run_size() >> os_psize_bits));
+			}*/
+			while (end.right != &end) {
+				PageRunHeader* p = end.right->parent();
+				if (p->run_count == 1) {
+					p->remove();
+					page_provider()->deallocate_pages(p, (size_t)(p->run_size() >> os_psize_bits));
+				}
+				else {
+					static constexpr unsigned runs = (1u << MICRO_ACCELERATION);
+					MICRO_ASSERT_DEBUG(p->run_count == runs, "");
+					for (unsigned i = 0; i < runs; ++i) {
+						PageRunHeader* h = (PageRunHeader*)((char*)p + i * max_medium_pages() * os_psize);
+						h->remove();
+					}
+					page_provider()->deallocate_pages(p, (size_t)(runs * max_medium_pages()));
+				}
+			}
+
+			page_provider()->reset();
+			page_map.reset();
+			// Since all pages were deallocated, the radix tree and memory pools are fully invalidated
+			// They will be recreated in the next call to allocate()
+			
+			
+			end.left = end.right = &end;
+			end_free.left_free = end_free.right_free = &end_free;
+			arenas = nullptr;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER PageRunHeader* MemoryManager::allocate_pages(size_t page_count) noexcept
+		{
+			size_t size_bytes = os_psize * page_count;
+			if (size_bytes % page_provider()->allocation_granularity()) {
+				size_bytes = (size_bytes / page_provider()->allocation_granularity() + 1u) * page_provider()->allocation_granularity();
+				page_count = size_bytes / os_psize;
+			}
+
+			std::unique_lock<lock_type> ll(lock);
+
+			PageRunHeader* res = nullptr;
+			if (page_count == max_medium_pages()) {
+				if (end_free.right_free != &end_free) {
+					res = end_free.right_free;
+					res->remove_free();
+					free_page_count -= max_medium_pages();
+					res->parent()->ref_cnt++;
+				}
+			}
+			
+			if (!res) {
+
+				size_t current_pages = used_pages.load() + free_page_count;
+
+				if ( page_count == max_medium_pages()) {
+
+					{
+						if (MICRO_UNLIKELY(params().memory_limit && params().memory_limit < (current_pages + page_count * (1u << MICRO_ACCELERATION)) * os_psize))
+							return nullptr;
+
+						UnlockGuard<lock_type> ul(lock);
+						
+						
+						res = (PageRunHeader*)page_provider()->allocate_pages(page_count * (1u << MICRO_ACCELERATION));
+						if (!res)
+							return nullptr;
+
+						new (res) PageRunHeader();
+						res->ref_cnt = 1;
+						res->run_count = (1u << MICRO_ACCELERATION);
+						res->size_bytes = size_bytes;
+
+						// create remaining runs
+						for (unsigned i = 1; i < (1u << MICRO_ACCELERATION); ++i) {
+							PageRunHeader* r = (PageRunHeader*)((char*)res + i * page_count * os_psize);
+							new (r) PageRunHeader();
+							r->size_bytes = size_bytes;
+							r->offset_parent = (unsigned)((char*)r - (char*)res);
+							r->arena = this;
+
+						}
+					}
+
+					free_page_count += max_medium_pages() * ((1u << MICRO_ACCELERATION)-1u);
+					res->insert(&end);
+					for (unsigned i = 1; i < (1u << MICRO_ACCELERATION); ++i) {
+						PageRunHeader* r = (PageRunHeader*)((char*)res + i * page_count * os_psize);
+						r->insert(&end);
+						r->insert_free(&end_free);
+					}
+
+				}
+				else {
+					{
+						if (MICRO_UNLIKELY(params().memory_limit && params().memory_limit < (current_pages + page_count) * os_psize))
+							return nullptr;
+
+						//UnlockGuard<lock_type> ul(lock);
+						res = (PageRunHeader*)page_provider()->allocate_pages(page_count);
+						if (!res)
+							return nullptr;
+						new (res) PageRunHeader();
+						res->size_bytes = size_bytes;
+						res->ref_cnt = res->run_count = 1;
+					}
+					res->insert(&end);
+				}
+			}
+			used_pages.fetch_add(page_count);
+			used_spans++;
+			if (used_pages.load() + free_page_count > max_pages.load())
+				max_pages.store(used_pages.load());
+			res->arena = this;
+			
+			return res;
+		}
+
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::deallocate_pages(PageRunHeader* p) noexcept
+		{
+			static constexpr unsigned runs = (1u << MICRO_ACCELERATION);
+
+			size_t page_count = (size_t)( p->size_bytes >> os_psize_bits);
+			std::uint64_t limit = 0;
+			if (params().backend_memory) {
+				if (params().backend_memory <= 100)
+					limit = used_pages.load() * params().backend_memory / 100;
+				else
+					limit = params().backend_memory;
+			}
+
+			std::unique_lock<lock_type> ll(lock);
+
+			//TEST
+			
+			PageRunHeader* r = end_free.right_free;
+			PageRunHeader* to_free = nullptr;
+			while (r != &end_free && free_page_count > limit) {
+				PageRunHeader* next = r->right_free;
+				if (r->parent()->ref_cnt == 0) {
+					for (unsigned i = 0; i < runs; ++i) {
+						PageRunHeader* h = (PageRunHeader*)((char*)r->parent() + i * max_medium_pages() * os_psize);
+						if(next == h)
+							next = h->right_free;
+						h->remove();
+						h->remove_free();
+						free_page_count -= max_medium_pages();
+					}
+					r->parent()->right_free = to_free;
+					to_free = r->parent();
+				}
+				r = next;
+			}
+			
+			if (to_free) {
+				UnlockGuard<lock_type> ul(lock);
+				do {
+					auto* next = to_free->right_free;
+					page_provider()->deallocate_pages(to_free, max_medium_pages() * runs);
+					to_free = next;
+				} while (to_free);
+			}
+
+			page_map.erase(p);
+
+			if (p->run_size() == (max_medium_pages() << os_psize_bits)) {
+				p->insert_free(&end_free);
+				p->parent()->ref_cnt--;
+				free_page_count += max_medium_pages();
+			}
+			else {
+				p->remove();
+				// deallocate right now
+				//UnlockGuard<lock_type> ul(lock);
+				page_provider()->deallocate_pages(p, page_count);
+				
+			}
+			used_pages -= page_count;
+			used_spans--;
+			
+
+
+			/*page_map.erase(p);
+			
+			if (page_count <= max_medium_pages() && (!avail || avail->run_size() < p->run_size()))
+				set_avail(p);
+			else 
+			{
+				MICRO_ASSERT_DEBUG(p != avail, "");
+				p->remove();
+				p->~PageRunHeader();
+				// deallocate right now
+				page_provider()->deallocate_pages(p, page_count);
+			}
+			used_pages -= page_count;
+			used_spans--;*/
+		}
+
+
+		MICRO_EXPORT_CLASS_MEMBER PageRunHeader* MemoryManager::allocate_medium_block() noexcept
+		{
+			PageRunHeader * run = allocate_pages(max_medium_pages());
+			if (run && !page_map.insert(run, false)) {
+				deallocate_pages(run);
+				return nullptr;
+			}
+
+#ifdef MICRO_DEBUG
+			std::lock_guard<lock_type> ll(lock);
+			// debug page map
+			auto* r = end.right;
+			while (r != &end) {
+				if (r->run_size() == MICRO_BLOCK_SIZE) {
+					/*auto* found =*/ page_map.find(r);
+					//MICRO_ASSERT_DEBUG(found, "");
+				}
+				r = r->right;
+			}
+#endif
+
+			return run;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER PageRunHeader* MemoryManager::allocate_pages_for_bytes(size_t bytes ) noexcept
+		{
+			size_t pages = bytes >> os_psize_bits;
+			if ((pages << os_psize_bits) < bytes)
+				++pages;
+			if (pages == 0)
+				pages = 1;
+			return allocate_pages(pages);
+		}
+
+#ifdef MICRO_ENABLE_TIME_STATISTICS
+		static MICRO_ALWAYS_INLINE timer& get_local_timer() noexcept {
+			thread_local timer t;
+			return t;
+		}
+#endif
+
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate_in_other_arenas(unsigned elems, unsigned align, Arena * first) noexcept
+		{
+			unsigned start = (unsigned)(first - arenas[0].arena()) + 1;
+			for (unsigned i = 0; i < params().max_arenas; ++i, ++start) {
+				Match m;
+				if (void* r = arenas[start & (params().max_arenas - 1u)].arena()->tree()->allocate_elems(elems, m, align, false))
+					return r;
+			}
+			return nullptr;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate_big_path(size_t bytes, bool stats) noexcept
+		{
+#ifdef MICRO_ENABLE_TIME_STATISTICS
+			if (stats)
+				get_local_timer().tick();
+#endif
+			void* res = allocate_big(bytes);
+			if (res && stats)
+				record_stats(res, MICRO_ALLOC_BIG);
+			return res;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate_recursive(Match & m, unsigned elems ) noexcept
+		{
+			// Potential recursion detected
+			void * res = arenas[0].arena()->tree()->allocate_elems(elems, m,0,true);
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+			if (params().print_stats_trigger)
+				record_stats(res, MICRO_ALLOC_MEDIUM);
+#endif
+			return res;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate_no_tiny_pool(size_t bytes, size_t minimum_bytes, unsigned align) noexcept
+		{
+			MICRO_ASSERT_DEBUG(bytes < max_medium_size(), "");
+
+			if (MICRO_UNLIKELY(!arenas))
+				if (!initialize_arenas())
+					return nullptr;
+
+			bytes = bytes == 0 ? 1 : bytes;
+
+			unsigned elems = (unsigned)((bytes >> MICRO_ELEM_SHIFT) + (bytes & (MICRO_HEADER_SIZE - 1) ? 1 : 0));
+			Match m;
+
+			void* r = get_arenas()[0].tree()->allocate_elems(elems, m, align, false);
+			if (!r) {
+				r = allocate_in_other_arenas(elems, align, get_arenas());
+				if (r)
+					return r;
+				if (minimum_bytes < bytes && minimum_bytes) {
+					unsigned min_elems = (unsigned)((minimum_bytes >> MICRO_ELEM_SHIFT) + (minimum_bytes & (MICRO_HEADER_SIZE - 1) ? 1 : 0));
+					m = Match{};
+					r = get_arenas()[0].tree()->allocate_elems(min_elems, m, align, false);
+					if (r) return r;
+					r = allocate_in_other_arenas(min_elems, align, get_arenas());
+					if (r) return r;
+				}
+					
+				m = Match{};
+				return get_arenas()[0].tree()->allocate_elems(elems, m, align, true);
+			}
+				
+			return r;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::deallocate_no_tiny_pool(void* p) noexcept
+		{
+			deallocate(p,false);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate_and_forget(unsigned size) noexcept 
+		{
+			return radix_pool.as_mem_pool()->allocate(size);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::allocate(size_t bytes, unsigned align) noexcept
+		{
+			if (MICRO_UNLIKELY(!arenas))
+				if (!initialize_arenas())
+					return nullptr;
+
+			MICRO_ASSERT_DEBUG(align == 0 || (align & (align - 1)) == 0, "");
+			MICRO_ASSERT_DEBUG(align <= page_size(), "");
+
+			if (MICRO_UNLIKELY(bytes > max_medium_size() - align))
+				return allocate_big_path(bytes, params().print_stats_trigger);
+
+			//TEST
+			/*static std::atomic<unsigned> thcounter{0};
+			static std::atomic<unsigned> mask{ 0 };
+			struct ThCounter {
+				std::atomic<unsigned>* c;
+				std::atomic<unsigned>* m;
+				unsigned max_arenas;
+				ThCounter(std::atomic<unsigned>& _c, std::atomic<unsigned> & mask, unsigned _max_arenas)
+					:c(&_c), m(&mask), max_arenas(_max_arenas){
+					
+					unsigned v = c->fetch_add(1, std::memory_order_relaxed) +1 ;
+					mask = ((1u << bit_scan_reverse_32(v)) - 1u) & (max_arenas - 1);
+				}
+				~ThCounter() {
+					unsigned v = c->fetch_sub(1, std::memory_order_relaxed) - 1;
+					*m = ((1u << bit_scan_reverse_32(v)) - 1u) & (max_arenas - 1);
+				}
+			};
+			thread_local ThCounter th(thcounter, mask, params().max_arenas);
+			static std::atomic<std::uint16_t> counter{ 0 };
+			static thread_local unsigned thidx = counter++;
+			unsigned idx = thidx & mask.load(std::memory_order_relaxed);
+			*/
+			if (bytes == 0) bytes = 1;
+
+			unsigned elems = (unsigned)((bytes >> MICRO_ELEM_SHIFT) + (bytes & (MICRO_HEADER_SIZE - 1) ? 1 : 0));
+			void* res;
+			Match m;
+
+#if MICRO_THREAD_LOCAL_NO_ALLOC == 0
+			// Detect recursion due, for instance, to thread_local storage
+			DetectRecursion::KeyHolder holder{ detect_recurs.insert((std::uint32_t)this_thread_id_hash()) };
+			if (MICRO_UNLIKELY(!holder)) {
+				return allocate_recursive(m, elems);
+			}
+#endif
+
+#ifdef MICRO_OVERRIDE
+			init();
+#endif
+			Arena *arena = select_arena();
+			//Arena* arena = get_arenas() + idx;
+
+
+#if defined( MICRO_ENABLE_STATISTICS_PARAMETERS) && defined(MICRO_ENABLE_TIME_STATISTICS)
+			if (stats)
+				get_local_timer().tick();
+#endif
+
+			if (align < MICRO_MINIMUM_ALIGNMENT * 2 && bytes <= params().small_alloc_threshold &&
+				(!params().allow_small_alloc_from_radix_tree || (bytes > MICRO_SMALL_SIZE || !arena->tree()->find_small_locked(bytes, elems, m)))) {
+				res = arena->tiny_pool()->allocate((unsigned)bytes, true);
+			}
+			else {
+				res = arena->tree()->allocate_elems(elems, m, align, params().max_arenas == 1);
+				if (!res && params().max_arenas > 1) {
+					res = allocate_in_other_arenas(elems, align, arena);
+					if (!res)
+						res = arena->tree()->allocate_elems(elems, m, align, true);
+				}
+			}
+
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+			if (params().print_stats_trigger && res)
+				record_stats(res);
+#endif
+
+			// check alignment
+			MICRO_ASSERT_DEBUG((uintptr_t)res % MICRO_MINIMUM_ALIGNMENT == 0, "");
+			return res;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::record_stats(void* p, int status) noexcept
+		{
+			if (!p)
+				return;
+
+			MICRO_TIME_STATS(this->mem_stats.total_alloc_time_ns.fetch_add(get_local_timer().tock()));
+
+			if (status == MICRO_ALLOC_SMALL_BLOCK) {
+				this->mem_stats.allocate_small(usable_size(p, MICRO_ALLOC_SMALL_BLOCK));
+			}
+			else {
+				size_t s = usable_size(p, status);
+				if (status == MICRO_ALLOC_BIG)
+					this->mem_stats.allocate_big(s);
+				else if (status == MICRO_ALLOC_SMALL)
+					this->mem_stats.allocate_small(s);
+				else if (status == MICRO_ALLOC_MEDIUM)
+					this->mem_stats.allocate_medium(s);
+			}
+
+			if (params().print_stats_trigger > 1)
+				print_stats_if_necessary();
+		}
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::record_stats(void* p) noexcept
+		{
+			int status = type_of(p);
+			record_stats(p, status);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void* MemoryManager::aligned_allocate(size_t alignment, size_t bytes) noexcept
+		{
+			return allocate(bytes, (unsigned)alignment);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::deallocate(void* p) noexcept
+		{
+			deallocate(p,true);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER MemoryManager* MemoryManager::find_from_page_run(PageRunHeader* run) noexcept
+		{
+			end_lock().lock_shared();
+			BaseMemoryManagerIter* m = end_mgr()->right;
+			MemoryManager* found = nullptr;
+			while (m != end_mgr()) {
+				if (static_cast<MemoryManager*>(m)->page_map.find(run)) {
+					found = static_cast<MemoryManager*>(m);
+					break;
+				}
+				m = m->right;
+			}
+			end_lock().unlock_shared();
+			return found;
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER int MemoryManager::type_of_maybe_small(SmallChunkHeader* tiny, TinyMemPoolHeader* h, block_pool_type* pool, void* p) noexcept
+		{
+			// we have a conflict here: this might be a very small object (without header) and we are unlucky to have the 
+			// tiny header set with valid values. Or, this really is a small/medium/big object with a header.
+			// To check that, we must get the corresponding PageRunHeader and find it into a map of all 
+			// allocated PageRunHeader. This must be done in last resort as it is relatively expensive.
+			// The first obvious cases are first checked.
+
+			PageRunHeader* run_from_tiny = h->parent_run();
+
+			if (tiny->status == MICRO_ALLOC_MEDIUM) {
+				// The most likely: a valid medium chunk located just at the end of a small block
+				MediumChunkHeader* mediumh = (MediumChunkHeader*)p - 1;
+				PageRunHeader* run_from_medium = mediumh->parent(); //(PageRunHeader*)(mediumh - mediumh->th.offset_bytes);
+				if (run_from_tiny == run_from_medium) {
+					// Ok, now we are sure the PageRunHeader is valid and can be accessed
+					// We sill need to check if the pool is accessible
+					if ((void*)pool > (void*)run_from_tiny && (char*)pool < (char*)run_from_tiny + run_from_tiny->run_size()) {
+						if (!pool->is_inside(p) || pool->is_big || pool->header.guard != MICRO_BLOCK_GUARD)
+							return tiny->status;
+					}
+				}
+			}
+			else if (tiny->status == MICRO_ALLOC_SMALL) {
+				// The most likely: a valid small chunk located just at the end of a small block
+				TinyMemPoolHeader* smallh = (TinyMemPoolHeader*)p - 1;
+				PageRunHeader* run_from_small = smallh->parent_run();
+				if (run_from_tiny == run_from_small) {
+					// Ok, now we are sure the PageRunHeader is valid and can be accessed
+					// We sill need to check if the pool is accessible
+					if ((void*)pool > (void*)run_from_tiny && (char*)pool < (char*)run_from_tiny + run_from_tiny->run_size()) {
+						if (!pool->is_inside(p) || pool->is_big || pool->header.guard != MICRO_BLOCK_GUARD)
+							return tiny->status;
+					}
+				}
+			}
+
+			// Ok, now we must find the corresponding page run and MemoryManager to go further
+			MemoryManager* m = find_from_page_run(run_from_tiny);
+			if (!m)
+				// Invalid block header, this is NOT a MICRO_ALLOC_SMALL_BLOCK
+				return tiny->status;
+
+			// At this point we know the block pool is accessible, but the pointer to deallocate might still be outside:
+			// we deallocate a medium chunk that starts right before the end of a block pool aligned on page size.
+			if (!pool->is_inside(p) || pool->is_big || pool->mgr != m)
+				return tiny->status;
+
+			// Final check: if this is not a small block, the pool run page should be invalid
+			if(!m->page_map.find(pool->get_parent_run()))
+				return tiny->status;
+
+			MICRO_ASSERT_DEBUG(pool->tail < block_pool_type::max_size_bytes, "");
+			return MICRO_ALLOC_SMALL_BLOCK;
+
+		}
+		
+		MICRO_EXPORT_CLASS_MEMBER int MemoryManager::type_of_safe(void* p, block_pool_type** block_pool, BaseMemoryManager** memory_mgr) noexcept
+		{
+			auto* tiny = (SmallChunkHeader*)((char*)p - 8);
+			int status = type_of(p, block_pool, memory_mgr);
+			if (status == MICRO_ALLOC_SMALL_BLOCK)
+				return MICRO_ALLOC_SMALL_BLOCK;
+
+			if (tiny->guard == MICRO_BLOCK_GUARD &&
+				(tiny->status == MICRO_ALLOC_BIG ||
+					tiny->status == MICRO_ALLOC_SMALL ||
+					tiny->status == MICRO_ALLOC_MEDIUM))
+				return tiny->status;
+			return 0;
+		}
+		
+		
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::deallocate(void* p, int status, block_pool_type* pool, BaseMemoryManager* mgr, bool stats) noexcept
+		{
+			if (status == MICRO_ALLOC_SMALL_BLOCK) {
+				block_pool_type* block_pool = static_cast<block_pool_type*>(pool);
+
+				MICRO_ASSERT_DEBUG(block_pool->is_inside(p), "");
+
+				size_t bytes = 0;
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+				MemoryManager* m = static_cast<MemoryManager*>(mgr);
+				if (m->params().print_stats_trigger && stats) {
+					MICRO_TIME_STATS(get_local_timer().tick());
+					bytes = usable_size(p, status);
+				}
+#endif
+				TinyMemPool::deallocate(p, block_pool);
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+				if (m->params().print_stats_trigger && stats) {
+					MICRO_TIME_STATS(m->mem_stats.total_dealloc_time_ns.fetch_add(get_local_timer().tock()));
+					m->mem_stats.deallocate_small(bytes);
+				}
+#endif
+				return;
+			}
+
+			auto* tiny = (SmallChunkHeader*)((char*)p - 8);
+			MICRO_ASSERT(tiny->guard == MICRO_BLOCK_GUARD, "");
+
+			if (tiny->status == MICRO_ALLOC_SMALL) {
+				auto* pl = block_pool_type::from_ptr(p);
+				MemoryManager* m = static_cast<MemoryManager*>(pl->get_parent()->d_mgr);
+				size_t bytes = 0;
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+				if (m->params().print_stats_trigger && stats) {
+					MICRO_TIME_STATS(get_local_timer().tick());
+					bytes = usable_size(p, status);
+				}
+#endif
+				TinyMemPool::deallocate(p, pl);
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+				if (m->params().print_stats_trigger && stats) {
+					MICRO_TIME_STATS(m->mem_stats.total_dealloc_time_ns.fetch_add(get_local_timer().tock()));
+					m->mem_stats.deallocate_small(bytes);
+				}
+#endif
+			}
+			else if (tiny->status == MICRO_ALLOC_MEDIUM) {
+				auto* parent = ((MediumChunkHeader*)((char*)p - MICRO_HEADER_SIZE))->parent();
+				auto* arena = (BaseArena*)parent->arena;
+				MemoryManager* m = static_cast<MemoryManager*>(arena->manager());
+#if defined( MICRO_ENABLE_STATISTICS_PARAMETERS) && defined(MICRO_ENABLE_TIME_STATISTICS)
+				if (m->params().print_stats_trigger && stats)
+					get_local_timer().tick();
+#endif
+				size_t bytes = static_cast<Arena*>(arena)->tree()->deallocate(p);
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+				if (m->params().print_stats_trigger && stats) {
+					MICRO_TIME_STATS(m->mem_stats.total_dealloc_time_ns.fetch_add(get_local_timer().tock()));
+					m->mem_stats.deallocate_medium(bytes);
+				}
+#endif
+			}
+			else {
+				MICRO_ASSERT_DEBUG(tiny->status == MICRO_ALLOC_BIG, "Invalid block header");
+				BigChunkHeader* h = (BigChunkHeader*)p - 1;
+				MICRO_ASSERT_DEBUG(h->th.guard == MICRO_BLOCK_GUARD, "");
+				MICRO_ASSERT_DEBUG(h->th.offset_bytes == sizeof(PageRunHeader), "");
+
+				PageRunHeader* mem = ((PageRunHeader*)h) - 1;
+				MemoryManager* m = static_cast<MemoryManager*>(mem->arena);
+#if defined( MICRO_ENABLE_STATISTICS_PARAMETERS) && defined(MICRO_ENABLE_TIME_STATISTICS)
+				if (m->params().print_stats_trigger && stats)
+					get_local_timer().tick();
+#endif
+				size_t bytes = usable_size(p, MICRO_ALLOC_BIG);
+				m->deallocate_pages(mem);
+#ifdef MICRO_ENABLE_STATISTICS_PARAMETERS
+				if (m->params().print_stats_trigger && stats) {
+					MICRO_TIME_STATS(m->mem_stats.total_dealloc_time_ns.fetch_add(get_local_timer().tock()));
+					m->mem_stats.deallocate_big(bytes);
+				}
+#endif
+			}
+		}
+
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::deallocate(void* p, bool stats) noexcept
+		{
+			if (MICRO_UNLIKELY(!p))
+				return;
+
+			//auto* tiny = (SmallChunkHeader*)((char*)p - 8);
+			block_pool_type* pool = nullptr;
+			BaseMemoryManager* mgr = nullptr;
+			int status = type_of(p, &pool, &mgr);
+
+			deallocate(p, status, pool, mgr, stats);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER size_t MemoryManager::usable_size(void* p, int status) noexcept
+		{
+			if (status == MICRO_ALLOC_SMALL_BLOCK)
+			{
+				uintptr_t aligned = (uintptr_t)p & ~(MICRO_ALIGNED_POOL - 1ull);
+				TinyMemPoolHeader* h = (TinyMemPoolHeader*)aligned;
+				block_pool_type* pool = (block_pool_type*)((std::uint64_t*)h - h->offset_block);
+				return SmallAllocation::idx_to_size(pool->pool_idx);
+			}
+
+			auto* tiny = (SmallChunkHeader*)((char*)p - 8);
+			MICRO_ASSERT_DEBUG(tiny->guard == MICRO_BLOCK_GUARD, "");
+
+			if (tiny->status == MICRO_ALLOC_BIG) {
+				BigChunkHeader* h = (BigChunkHeader*)p - 1;
+				MICRO_ASSERT_DEBUG(h->th.guard == MICRO_BLOCK_GUARD, "");
+				MICRO_ASSERT_DEBUG(h->th.status == MICRO_ALLOC_BIG, "");
+				MICRO_ASSERT_DEBUG(h->th.offset_bytes == sizeof(PageRunHeader), "");
+
+				PageRunHeader* mem = ((PageRunHeader*)h) - 1;
+				return (size_t)(mem->run_size() - sizeof(PageRunHeader) - sizeof(BigChunkHeader) );
+			}
+			else if (tiny->status == MICRO_ALLOC_SMALL) {
+				auto* pl = block_pool_type::from_ptr(p);
+				return SmallAllocation::idx_to_size(pl->pool_idx);
+			}
+			else if (tiny->status == MICRO_ALLOC_MEDIUM) {
+				MediumChunkHeader* f = (MediumChunkHeader*)((char*)p - sizeof(MediumChunkHeader));
+				return (f->elems << MICRO_ELEM_SHIFT) ;
+			}
+
+			MICRO_ASSERT(false, "Invalid block header");
+			MICRO_UNREACHABLE();
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER size_t MemoryManager::usable_size(void* p) noexcept
+		{
+			if (MICRO_UNLIKELY(!p))
+				return 0;
+
+			int status = type_of(p);
+			return usable_size(p, status);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::reset_statistics() noexcept
+		{
+			this->mem_stats.reset();
+			this->last_bytes.store(0);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::set_start_time()
+		{
+			this->start_time.store(std::clock());
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::dump_statistics(micro_statistics& st) noexcept
+		{
+			st.max_alloc_bytes = stats().max_alloc_bytes;
+			st.total_alloc_bytes = stats().total_alloc_bytes;
+
+			st.small.alloc_count = stats().small.alloc_count;
+			st.small.freed_count = stats().small.freed_count;
+			st.small.alloc_bytes = stats().small.alloc_bytes;
+			st.small.freed_bytes = stats().small.freed_bytes;
+			st.small.current_alloc_count = stats().small.current_alloc_count;
+			st.small.current_alloc_bytes = stats().small.current_alloc_bytes;
+
+			st.medium.alloc_count = stats().medium.alloc_count;
+			st.medium.freed_count = stats().medium.freed_count;
+			st.medium.alloc_bytes = stats().medium.alloc_bytes;
+			st.medium.freed_bytes = stats().medium.freed_bytes;
+			st.medium.current_alloc_count = stats().medium.current_alloc_count;
+			st.medium.current_alloc_bytes = stats().medium.current_alloc_bytes;
+
+			st.big.alloc_count = stats().big.alloc_count;
+			st.big.freed_count = stats().big.freed_count;
+			st.big.alloc_bytes = stats().big.alloc_bytes;
+			st.big.freed_bytes = stats().big.freed_bytes;
+			st.big.current_alloc_count = stats().big.current_alloc_count;
+			st.big.current_alloc_bytes = stats().big.current_alloc_bytes;
+
+			st.total_alloc_time_ns = stats().total_alloc_time_ns;
+			st.total_dealloc_time_ns = stats().total_dealloc_time_ns;
+		}
+
+		static inline std::uint64_t div_bytes(std::uint64_t a, std::uint64_t b) noexcept {
+			return b == 0 ? (std::uint64_t)0 :
+				(std::uint64_t)((double)a / (double)b);
+		}
+
+		
+		
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats_header(logger::print_callback_type callback, void* opaque)noexcept
+		{
+			logger::print_direct(callback, opaque,"DATE", "PEAK_PAGES\tCURRENT_PAGES\tCURRENT_SPANS\tPEAK_REQ_MEM\tPEAK_MEM\tCURRENT_MEM\tALLOCS\tALLOCS_B\tALLOCS_AVG\tFREE\tFREE_B\tCURRENT\tCURRENT_B\tCURRENT_AVG\t"
+				"S_ALLOCS\tS_ALLOCS_B\tS_ALLOCS_AVG\tS_FREE\tS_FREE_B\tS_CURRENT\tS_CURRENT_B\tS_CURRENT_AVG\t"
+				"M_ALLOCS\tM_ALLOCS_B\tM_ALLOCS_AVG\tM_FREE\tM_FREE_B\tM_CURRENT\tM_CURRENT_B\tM_CURRENT_AVG\t"
+				"B_ALLOCS\tB_ALLOCS_B\tB_ALLOCS_AVG\tB_FREE\tB_FREE_B\tB_CURRENT\tB_CURRENT_B\tB_CURRENT_AVG\n");
+		}
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats_header_stdout()noexcept
+		{
+			print_stats_header(alloc_callback_std, stdout);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats_row(logger::print_callback_type callback, void* opaque)noexcept
+		{
+			auto tot_alloc = this->mem_stats.small.alloc_count.load() + this->mem_stats.medium.alloc_count.load() + this->mem_stats.big.alloc_count.load();
+			auto tot_alloc_bytes = this->mem_stats.small.alloc_bytes.load() + this->mem_stats.medium.alloc_bytes.load() + this->mem_stats.big.alloc_bytes.load();
+			auto tot_freed = this->mem_stats.small.freed_count.load() + this->mem_stats.medium.freed_count.load() + this->mem_stats.big.freed_count.load();
+			auto tot_freed_bytes = this->mem_stats.small.freed_bytes.load() + this->mem_stats.medium.freed_bytes.load() + this->mem_stats.big.freed_bytes.load();
+
+			auto cur_alloc = this->mem_stats.small.current_alloc_count.load() + this->mem_stats.medium.current_alloc_count.load() + this->mem_stats.big.current_alloc_count.load();
+			auto cur_alloc_bytes = this->mem_stats.total_alloc_bytes.load();
+
+
+			logger::print_direct(callback, opaque, nullptr, MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t"
+				MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t"
+				MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t"
+				MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\t" MICRO_U64F "\n",
+				max_pages.load(), used_pages.load(), used_spans.load(),
+				this->mem_stats.max_alloc_bytes.load(), max_pages.load() * page_size(), used_pages.load() * page_size(),
+				tot_alloc, tot_alloc_bytes, div_bytes(tot_alloc_bytes, tot_alloc), tot_freed, tot_freed_bytes, cur_alloc, cur_alloc_bytes, div_bytes(cur_alloc_bytes, cur_alloc),
+				this->mem_stats.small.alloc_count.load(), this->mem_stats.small.alloc_bytes.load(), div_bytes(this->mem_stats.small.alloc_bytes, this->mem_stats.small.alloc_count), this->mem_stats.small.freed_count.load(), this->mem_stats.small.freed_bytes.load(), this->mem_stats.small.current_alloc_count.load(), this->mem_stats.small.current_alloc_bytes.load(), div_bytes(this->mem_stats.small.current_alloc_bytes, this->mem_stats.small.current_alloc_count),
+				this->mem_stats.medium.alloc_count.load(), this->mem_stats.medium.alloc_bytes.load(), div_bytes(this->mem_stats.medium.alloc_bytes, this->mem_stats.medium.alloc_count), this->mem_stats.medium.freed_count.load(), this->mem_stats.medium.freed_bytes.load(), this->mem_stats.medium.current_alloc_count.load(), this->mem_stats.medium.current_alloc_bytes.load(), div_bytes(this->mem_stats.medium.current_alloc_bytes, this->mem_stats.medium.current_alloc_count),
+				this->mem_stats.big.alloc_count.load(), this->mem_stats.big.alloc_bytes.load(), div_bytes(this->mem_stats.big.alloc_bytes, this->mem_stats.big.alloc_count), this->mem_stats.big.freed_count.load(), this->mem_stats.big.freed_bytes.load(), this->mem_stats.big.current_alloc_count.load(), this->mem_stats.big.current_alloc_bytes.load(), div_bytes(this->mem_stats.big.current_alloc_bytes, this->mem_stats.big.current_alloc_count)
+			);
+		}
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats_row_stdout()noexcept
+		{
+			print_stats_row(alloc_callback_std, stdout);
+		}
+
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats(logger::print_callback_type callback, void* opaque) noexcept
+		{
+			auto tot_alloc = this->mem_stats.small.alloc_count.load() + this->mem_stats.medium.alloc_count.load() + this->mem_stats.big.alloc_count.load();
+			auto tot_alloc_bytes = this->mem_stats.small.alloc_bytes.load() + this->mem_stats.medium.alloc_bytes.load() + this->mem_stats.big.alloc_bytes.load();
+			auto tot_freed = this->mem_stats.small.freed_count.load() + this->mem_stats.medium.freed_count.load() + this->mem_stats.big.freed_count.load();
+			auto tot_freed_bytes = this->mem_stats.small.freed_bytes.load() + this->mem_stats.medium.freed_bytes.load() + this->mem_stats.big.freed_bytes.load();
+			
+			auto cur_alloc = this->mem_stats.small.current_alloc_count.load() + this->mem_stats.medium.current_alloc_count.load() + this->mem_stats.big.current_alloc_count.load();
+			auto cur_alloc_bytes = this->mem_stats.total_alloc_bytes.load();
+
+			logger::print_direct(callback, opaque, nullptr, "\nPages: max pages " MICRO_U64F ", current pages " MICRO_U64F  ", current spans " MICRO_U64F "\n"
+				"Global: max requested memory " MICRO_U64F " bytes, max used memory: " MICRO_U64F ", current used memory: " MICRO_U64F "\n"
+				"Total allocations:\t alloc " MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc),\t free " MICRO_U64F " (" MICRO_U64F " bytes),\t current "  MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc)\n"
+				"Small allocations:\t alloc " MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc),\t free " MICRO_U64F " (" MICRO_U64F " bytes),\t current "  MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc)\n"
+				"Medium allocations:\t alloc " MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc),\t free " MICRO_U64F " (" MICRO_U64F " bytes),\t current "  MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc)\n"
+				"Big allocations:\t alloc " MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc),\t free " MICRO_U64F " (" MICRO_U64F " bytes),\t current "  MICRO_U64F " (" MICRO_U64F " bytes, avg. " MICRO_U64F "/alloc)\n"
+				"Timer allocation (ns):\t total " MICRO_U64F ", average " MICRO_U64F "\n"
+				"Timer deallocation (ns):\t total " MICRO_U64F ", average " MICRO_U64F "\n\n",
+
+				max_pages.load(), used_pages.load(), used_spans.load(),
+				this->mem_stats.max_alloc_bytes.load(), max_pages.load()*page_size(), used_pages.load()* page_size(),
+				tot_alloc, tot_alloc_bytes, div_bytes(tot_alloc_bytes, tot_alloc), tot_freed,tot_freed_bytes, cur_alloc, cur_alloc_bytes, div_bytes(cur_alloc_bytes, cur_alloc),
+				this->mem_stats.small.alloc_count.load(), this->mem_stats.small.alloc_bytes.load(), div_bytes(this->mem_stats.small.alloc_bytes, this->mem_stats.small.alloc_count), this->mem_stats.small.freed_count.load(), this->mem_stats.small.freed_bytes.load(), this->mem_stats.small.current_alloc_count.load(), this->mem_stats.small.current_alloc_bytes.load(), div_bytes(this->mem_stats.small.current_alloc_bytes , this->mem_stats.small.current_alloc_count),
+				this->mem_stats.medium.alloc_count.load(), this->mem_stats.medium.alloc_bytes.load(), div_bytes(this->mem_stats.medium.alloc_bytes, this->mem_stats.medium.alloc_count), this->mem_stats.medium.freed_count.load(), this->mem_stats.medium.freed_bytes.load(), this->mem_stats.medium.current_alloc_count.load(), this->mem_stats.medium.current_alloc_bytes.load(), div_bytes(this->mem_stats.medium.current_alloc_bytes , this->mem_stats.medium.current_alloc_count),
+				this->mem_stats.big.alloc_count.load(), this->mem_stats.big.alloc_bytes.load(), div_bytes(this->mem_stats.big.alloc_bytes, this->mem_stats.big.alloc_count), this->mem_stats.big.freed_count.load(), this->mem_stats.big.freed_bytes.load(), this->mem_stats.big.current_alloc_count.load(), this->mem_stats.big.current_alloc_bytes.load(), div_bytes(this->mem_stats.big.current_alloc_bytes, this->mem_stats.big.current_alloc_count),
+				this->mem_stats.total_alloc_time_ns.load(), div_bytes(this->mem_stats.total_alloc_time_ns.load() , (this->mem_stats.small.alloc_count.load() + this->mem_stats.medium.alloc_count.load() + this->mem_stats.big.alloc_count.load() )),
+				this->mem_stats.total_dealloc_time_ns.load(), div_bytes(this->mem_stats.total_dealloc_time_ns.load(), (this->mem_stats.small.freed_count.load() + this->mem_stats.medium.freed_count.load() + this->mem_stats.big.freed_count.load()))
+				);
+		}
+		MICRO_EXPORT_CLASS_MEMBER void MemoryManager::print_stats_stdout() noexcept
+		{
+			print_stats(alloc_callback_std, stdout);
+		}
+
+	} // end namespace detail
+
+
+} //end namespace micro
+
+MICRO_POP_DISABLE_OLD_STYLE_CAST
+
+

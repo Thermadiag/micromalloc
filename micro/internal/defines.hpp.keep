@@ -1,0 +1,156 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2024 Victor Moncada <vtr.moncada@gmail.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#ifndef MICRO_DEFINES_HPP
+#define MICRO_DEFINES_HPP
+
+#include "../bits.hpp"
+#include "../micro_config.hpp"
+
+
+ // Header size for memory block in the radix tree
+#define MICRO_HEADER_SIZE 16u
+// Shift value for multiplication/division by MICRO_HEADER_SIZE
+#define MICRO_ELEM_SHIFT 4u
+// Maximum block size + 1 (in bytes) the radix tree can represent
+#define MICRO_MAX_RADIX_ELEMS ((1u << (micro::detail::RadixAccess<>::max_bits + MICRO_ELEM_SHIFT)))
+
+// Maximum number of arenas
+#ifndef MICRO_MAX_ARENAS
+#define MICRO_MAX_ARENAS 16u
+#endif
+
+#if defined(MICRO_ARCH_64)
+// Radix tree size
+#define MICRO_MAX_RADIX_SIZE 16u
+// Maximum size for small objects (using TinyMemPool class)
+#define MICRO_MAX_SMALL_ALLOC_THRESHOLD 512
+// Page run size used by the radix tree
+#define MICRO_BLOCK_SIZE (1048576ull)  // 256 pages of 4096 bytes
+#define MICRO_MAX_ACCELERATION 3
+#else
+#define MICRO_MAX_RADIX_SIZE 15u
+#define MICRO_MAX_SMALL_ALLOC_THRESHOLD 496
+#define MICRO_BLOCK_SIZE (1048576ull /2)  // 128 pages of 4096 bytes
+#define MICRO_MAX_ACCELERATION 2
+#endif
+
+
+// Maximum size for small classes
+#ifndef MICRO_SMALL_ALLOC_THRESHOLD
+#define MICRO_SMALL_ALLOC_THRESHOLD MICRO_MAX_SMALL_ALLOC_THRESHOLD 
+#else
+#if MICRO_SMALL_ALLOC_THRESHOLD > MICRO_MAX_SMALL_ALLOC_THRESHOLD 
+error "Invalid small allocation threshold."
+#endif
+#endif
+
+// Allow allcoating from the radix tree for small objects
+#ifndef MICRO_ALLOW_SMALL_ALLOC_FROM_RADIX_TREE
+#define MICRO_ALLOW_SMALL_ALLOC_FROM_RADIX_TREE true
+#endif
+
+// Default page size when allocating from preallocated memory or from a file
+#ifndef MICRO_DEFAULT_PAGE_SIZE
+#define MICRO_DEFAULT_PAGE_SIZE 4096
+#endif
+
+// Minimum/maximum supported page size 
+#define MICRO_MINIMUM_PAGE_SIZE 2048
+#define MICRO_MAXIMUM_PAGE_SIZE 65536
+
+// Grow factor when allocating from a file
+#ifndef MICRO_DEFAULT_GROW_FACTOR
+#define MICRO_DEFAULT_GROW_FACTOR 1.6 
+#endif
+
+// Minimum alignment for small allocations (and for the micro library in general)
+#ifdef MICRO_ALIGN_16
+#define MICRO_MINIMUM_ALIGNMENT 16
+#else
+#define MICRO_MINIMUM_ALIGNMENT 8
+#endif
+
+// Enable/disable statistics support
+#ifndef MICRO_DISABLE_STATISTICS
+#define MICRO_ENABLE_STATISTICS_PARAMETERS
+#endif
+
+// Enable/disable time statistics support
+#ifdef MICRO_ENABLE_TIME_STATISTICS
+#define MICRO_TIME_STATS(...) __VA_ARGS__
+#else
+#define MICRO_TIME_STATS(...)
+#endif
+
+#ifndef MICRO_ACCELERATION
+#define MICRO_ACCELERATION 0
+#else
+#if MICRO_ACCELERATION > MICRO_MAX_ACCELERATION
+#undef MICRO_ACCELERATION
+#define MICRO_ACCELERATION MICRO_MAX_ACCELERATION
+#endif
+#endif
+
+// Detect if a thread_local variable might trigger a malloc() call.
+// This could lead to infinit recursion when malloc/free functions are overridden.
+// Such recursions MUST be detected through the use of a dedicated hash map.
+#ifndef MICRO_OVERRIDE
+#define MICRO_THREAD_LOCAL_NO_ALLOC 1
+#else
+#ifdef _MSC_VER
+#define MICRO_THREAD_LOCAL_NO_ALLOC 1
+#else
+#define MICRO_THREAD_LOCAL_NO_ALLOC 0
+#endif
+#endif
+
+
+// Small allocation flag
+#define MICRO_ALLOC_SMALL 62639
+// Medium allocation flag
+#define MICRO_ALLOC_MEDIUM 62761
+// Big allocation flag, directly based on pages allocation/deallocation
+#define MICRO_ALLOC_BIG 62897
+// Free block flag
+#define MICRO_ALLOC_FREE 64063
+// Aligned block of small objects
+#define MICRO_ALLOC_SMALL_BLOCK  64067
+// Allocation hader guard
+#define MICRO_BLOCK_GUARD 64171 
+
+// Alignment for a block of tiny objects
+#define MICRO_ALIGNED_POOL MICRO_MINIMUM_PAGE_SIZE
+// Maximum size for object blocks in TinyMemPool
+#define MICRO_SMALL_BLOCK_MAX_SIZE ((1u << (16u + MICRO_ACCELERATION)))
+// Threshold for tiny objects.
+// Objects with a size <= MICRO_SMALL_SIZE are considered tiny.
+// They are allocated within a TinyMemPool, but without header.
+// Must be a multiple of 16.
+#define MICRO_SMALL_SIZE (80+32)
+
+#define MICRO_DEFAULT_BACKEND_MEMORY (((1u << MICRO_ACCELERATION) - 1u) * 10u)
+
+#endif
+
