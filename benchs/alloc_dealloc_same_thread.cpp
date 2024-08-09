@@ -29,7 +29,7 @@ extern "C" {
 #include "jemalloc.h"
 }
 #endif
-
+static size_t el_alloc{0};
 static size_t thcount{ 0 };
 static std::atomic<int> finish_count{ 0 };
 static std::atomic<bool> start_compute{ false };
@@ -74,7 +74,7 @@ void test_allocator(const char* allocator, std::vector<void*>* ptr, std::vector<
 			threads[i].join();
 
 		micro::allocator_trim(allocator);
-		size_t el_alloc = micro::tock_ms();
+		el_alloc = micro::tock_ms();
 
 		size_t bytes = 0;
 		for (unsigned b : *sizes)
@@ -135,16 +135,27 @@ int alloc_dealloc_same_thread(int, char** const)
 	// micro_set_parameter(MicroBackendMemory, 3000000000ull);
 	unsigned max_size = 0;
 
+
 #ifndef MICRO_TEST_THREAD
-	std::cout << "Thread count:";
-	std::cin >> thcount;
+	const char * MICRO_TEST_THREAD = std::getenv("MICRO_TEST_THREAD");
+	if(MICRO_TEST_THREAD)
+		thcount = micro::detail::from_string<size_t>(MICRO_TEST_THREAD);
+	else {
+		std::cout << "Thread count:";
+		std::cin >> thcount;
+	}
 #else
 	thcount = MICRO_TEST_THREAD;
 #endif
 
 #ifndef MICRO_TEST_SIZE
-	std::cout << "Max alloc size:";
-	std::cin >> max_size;
+	const char * MICRO_TEST_SIZE = std::getenv("MICRO_TEST_SIZE");
+	if(MICRO_TEST_SIZE)
+		max_size = micro::detail::from_string<unsigned>(MICRO_TEST_SIZE);
+	else {
+		std::cout << "Max alloc size:";
+		std::cin >> max_size;
+	}
 #else
 	max_size = MICRO_TEST_SIZE;
 #endif
@@ -220,19 +231,11 @@ int alloc_dealloc_same_thread(int, char** const)
 	print_process_infos();
 #endif
 
-	int* ptrs[16];
-	uintptr_t min_align = 4096;
-	for (int i = 0; i < 16; ++i) {
-		ptrs[i] = (int*)malloc(sizeof(int));
-		uintptr_t addr = (uintptr_t)ptrs[i];
-		uintptr_t align = 1u << bit_scan_forward_64(addr);
-		min_align = std::min(align, min_align);
-	}
-	for (int i = 0; i < 16; ++i)
-		free(ptrs[i]);
-
-	std::cout << "max_align_t: " << alignof(std::max_align_t) << std::endl;
-	std::cout << "measured alignment: " << min_align << std::endl;
+	micro_process_infos infos;
+	micro_get_process_infos(&infos);
+	std::cout << "Threads: "<<thcount<<std::endl;
+	std::cout << "Peak RSS (MB): " << (infos.peak_rss - (ptr.size()*sizeof(void*) + ss.size() * sizeof(unsigned)))/(1024*1024)<< std::endl;
+	std::cout << "Time (s): " << (double)el_alloc / 1000. << std::endl;
 
 	return 0;
 }

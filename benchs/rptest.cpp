@@ -854,6 +854,13 @@ benchmark_run(int argc, char** argv, bool init) {
 	}*/
 
 	size_t thread_count = 10;// (size_t)strtol(argv[1], 0, 10);
+#ifndef MICRO_TEST_THREAD
+	const char * MICRO_TEST_THREAD = std::getenv("MICRO_TEST_THREAD");
+	if(MICRO_TEST_THREAD)
+		thread_count = micro::detail::from_string<size_t>(MICRO_TEST_THREAD);
+#else
+	thread_count=MICRO_TEST_THREAD;
+#endif
 	size_t mode = 0;// (size_t)strtol(argv[2], 0, 10);
 	size_t size_mode = 0;// (size_t)strtol(argv[3], 0, 10);
 	size_t cross_rate = 0;// (size_t)strtol(argv[4], 0, 10);
@@ -862,7 +869,13 @@ benchmark_run(int argc, char** argv, bool init) {
 	size_t op_count = 10;// (size_t)strtol(argv[7], 0, 10);
 	size_t min_size = 1;// (size_t)strtol(argv[8], 0, 10);
 	size_t max_size = 1000;// (argc > 9) ? (size_t)strtol(argv[9], 0, 10) : 0;
-
+#ifndef MICRO_TEST_SIZE
+	const char * MICRO_TEST_SIZE = std::getenv("MICRO_TEST_SIZE");
+	if(MICRO_TEST_SIZE)
+		max_size = micro::detail::from_string<size_t>(MICRO_TEST_SIZE);
+#else
+	max_size = MICRO_TEST_SIZE;
+#endif
 	if ((thread_count < 1) || (thread_count > 1000)) {
 		printf("Invalid thread count: %s\n", argv[1]);
 		return -3;
@@ -1104,13 +1117,17 @@ benchmark_run(int argc, char** argv, bool init) {
 		100.0 * ((double)memory_usage - (double)sample_allocated) / (double)sample_allocated);
 	fflush(stdout);
 
+	micro_process_infos infos;
+	micro_get_process_infos(&infos);
+	std::cout << "Peak RSS (MB): " << (infos.peak_rss )/(1024.*1024.)<< std::endl;
+
 	if (fd)
 		fclose(fd);
 
 	if (benchmark_finalize() < 0)
 		return -4;
 
-	micro::print_process_infos();
+	//micro::print_process_infos();
 
 	return 0;
 }

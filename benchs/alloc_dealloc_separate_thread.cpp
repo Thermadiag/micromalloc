@@ -5,6 +5,7 @@
 #include <thread>
 #include <iostream>
 
+static size_t el_alloc=0;
 static size_t thcount{ 0 };
 static std::atomic<int> finish_count{ 0 };
 static std::atomic<bool> start_compute{ false };
@@ -18,7 +19,7 @@ void test_alloc_dealloc_thread(std::vector<std::atomic<void*>>* ptr, const std::
 		std::this_thread::yield();
 
 	// do 5 passes
-	// for (int pass = 0; pass < 5; ++pass)
+	for (int pass = 0; pass < 5; ++pass)
 	for (size_t i = 0; i < ptr->size(); i++) {
 		size_t idx = (order)[i];
 		void* p = (*ptr)[idx].load(std::memory_order_relaxed);
@@ -77,7 +78,7 @@ void test_allocator_simultaneous_alloc_dealloc(const char* allocator, std::vecto
 
 		micro::allocator_trim(allocator);
 
-		size_t el_alloc = micro::tock_ms();
+		el_alloc = micro::tock_ms();
 
 		std::cout << "Interleaved allocation/deallocation in different threads" << std::endl;
 		std::cout << el_alloc << " ms" << std::endl;
@@ -90,16 +91,27 @@ int alloc_dealloc_separate_thread(int, char** const)
 
 	unsigned max_size = 0;
 
+
 #ifndef MICRO_TEST_THREAD
-	std::cout << "Thread count:";
-	std::cin >> thcount;
+	const char * MICRO_TEST_THREAD = std::getenv("MICRO_TEST_THREAD");
+	if(MICRO_TEST_THREAD)
+		thcount = micro::detail::from_string<size_t>(MICRO_TEST_THREAD);
+	else {
+		std::cout << "Thread count:";
+		std::cin >> thcount;
+	}
 #else
 	thcount = MICRO_TEST_THREAD;
 #endif
 
 #ifndef MICRO_TEST_SIZE
-	std::cout << "Max alloc size:";
-	std::cin >> max_size;
+	const char * MICRO_TEST_SIZE = std::getenv("MICRO_TEST_SIZE");
+	if(MICRO_TEST_SIZE)
+		max_size = micro::detail::from_string<unsigned>(MICRO_TEST_SIZE);
+	else {
+		std::cout << "Max alloc size:";
+		std::cin >> max_size;
+	}
 #else
 	max_size = MICRO_TEST_SIZE;
 #endif
@@ -109,7 +121,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 
 	srand(0);
 
-	size_t max_mem = 1000000000ull;
+	size_t max_mem = 500000000ull;
 	size_t alloc_count = max_mem / (max_size / 2);
 
 	std::vector<unsigned> ss(alloc_count);
@@ -210,6 +222,17 @@ int alloc_dealloc_separate_thread(int, char** const)
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 #endif
+
+	size_t additional = ss.size() * sizeof(unsigned);
+	additional += order.size() * sizeof(size_t);
+	for(size_t i=0; i < orders.size(); ++i)
+		additional += orders[i].size() * sizeof(size_t);
+
+	micro_process_infos infos;
+	micro_get_process_infos(&infos);
+	std::cout << "Threads: "<<thcount<<std::endl;
+	std::cout << "Peak RSS (MB): " << (infos.peak_rss - additional)/(1024*1024)<< std::endl;
+	std::cout << "Time (s): " << (double)el_alloc / 1000. << std::endl;
 
 	return 0;
 }

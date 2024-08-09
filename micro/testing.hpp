@@ -135,6 +135,14 @@ namespace micro
 			ss << value;
 			return ss.str();
 		}
+		template<class T>
+		T from_string(const char* value)
+		{
+			std::istringstream ss(value);
+			T v = 0;
+			ss >> v;
+			return v;
+		}
 	}
 
 }
