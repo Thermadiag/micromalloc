@@ -615,7 +615,7 @@ int larson(int argc, char* argv[])
     int          chperthread = 10;
 #endif
     unsigned     seed = 12345;
-    int          num_chunks = 10000;
+    int          num_chunks = 100000;
     long sleep_cnt = 1;
     int          min_size = 10, max_size = 500;
 

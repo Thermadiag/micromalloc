@@ -5,7 +5,7 @@
 #include <thread>
 #include <iostream>
 
-#define MAX_THREADS 20
+#define MAX_THREADS 16
 
 static size_t el_alloc=0;
 static size_t thcount{ 0 };
@@ -16,30 +16,52 @@ static std::atomic<size_t> max_allocated{ 0 };
 
 class Counter
 {
-	std::atomic<size_t> sizes[MAX_THREADS];
+	unsigned sizes[MAX_THREADS];
 	size_t ops[MAX_THREADS];
 	size_t thread_count;
+	size_t thread_count_up;
 
 public:
 	Counter(size_t threads)
 	  : thread_count(threads)
 	{
-		for (size_t i = 0; i < thread_count; ++i) {
+		thread_count_up = threads;
+		if(thread_count_up & 1) ++thread_count_up;
+		for (size_t i = 0; i < MAX_THREADS; ++i) {
 			ops[i] = 0;
 			sizes[i] = 0;
 		}
 	}
 
-	size_t add(size_t thread_idx, size_t size)
+	MICRO_ALWAYS_INLINE size_t add(size_t thread_idx, size_t size)
 	{
 		++ops[thread_idx];
-		sizes[thread_idx] += size;
-		size_t tot = 0;
-		for (size_t i = 0; i < thread_count; ++i)
-			tot += sizes[i].load(std::memory_order_relaxed);
+		sizes[thread_idx]+= size;
+		unsigned tot = 0;
+		unsigned count = (unsigned)thread_count_up;
+		unsigned * ss = sizes;
+		
+		while(count >= 4){
+			tot += ss[0];
+			tot += ss[1];
+			tot += ss[2];
+			tot += ss[3];
+			ss+=4;count-=4;
+		}
+		if(count >= 2){
+			tot += ss[0];
+			tot += ss[1];
+			ss+=2;count-=2;
+		}
+		if(count)
+			tot+=ss[0];
+		/*for (size_t i = 0; i < thread_count_up; i+=2) {
+			tot += sizes[i];
+			tot += sizes[i +1];
+		}*/
 		return tot;
 	}
-	void sub(size_t thread_idx, size_t size) { 
+	MICRO_ALWAYS_INLINE void sub(size_t thread_idx, size_t size) { 
 		sizes[thread_idx] -= size;
 		++ops[thread_idx];
 	}
@@ -73,8 +95,14 @@ void test_alloc_dealloc_thread(unsigned count, std::atomic<void*>* ptr, const si
 				T::free_mem(m);
 				c->sub(thread_idx, s);
 			}
-			 else if (peak > max_allocated.load(std::memory_order_relaxed))
-				max_allocated.store(peak);
+			 else { 
+				size_t m = max_allocated.load(std::memory_order_relaxed);
+				if(peak > m) max_allocated.store(peak);
+				/*{
+					if(max_allocated.compare_exchange_strong(m,peak) ) 
+						break;
+				}*/
+			}
 		}
 		else {
 			void* m = (ptr)[idx].exchange(nullptr);
@@ -170,14 +198,14 @@ void test_allocator_simultaneous_alloc_dealloc(const char* allocator, size_t max
 		total_ops = counter.total_ops();
 	}
 
-	//micro::allocator_trim(allocator);
+	micro::allocator_trim(allocator);
 	el_alloc = micro::tock_ms();
 
 	
 
 	micro_process_infos infos;
 	micro_get_process_infos(&infos);
-	std::cout << "Threads\tOps/s\tMemoryOverhead" << std::endl;
+	//std::cout << "Threads\tOps/s\tMemoryOverhead" << std::endl;
 	double overhead = (infos.peak_rss - additional);
 	overhead /= max_allocated.load();
 
@@ -247,61 +275,61 @@ int alloc_dealloc_separate_thread(int, char** const)
 #ifdef MICRO_BENCH_MICROMALLOC
 	start_compute = false;
 	max_allocated = 0;
-	std::cout << "micro:" << std::endl;
+	//std::cout << "micro:" << std::endl;
 	test_allocator_simultaneous_alloc_dealloc<Alloc>("micro", max_size,max_mem);
-	micro_clear();
-	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
-	print_process_infos();
+	//micro_clear();
+	//std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_MALLOC
 	start_compute = false;
 	max_allocated = 0;
-	std::cout << "malloc:" << std::endl;
+	//std::cout << "malloc:" << std::endl;
 	test_allocator_simultaneous_alloc_dealloc<Malloc>("malloc", max_size, max_mem);
-	malloc_trim(0);
-	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
-	print_process_infos();
+	//malloc_trim(0);
+	//std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_JEMALLOC
 	// const char* je_malloc_conf = "dirty_decay_ms:0";
 	start_compute = false;
 	max_allocated = 0;
-	std::cout << "jemalloc:" << std::endl;
+	//std::cout << "jemalloc:" << std::endl;
 	test_allocator_simultaneous_alloc_dealloc<Jemalloc>("jemalloc", max_size, max_mem);
-	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
-	print_process_infos();
+	//std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_SNMALLOC
 	start_compute = false;
 	max_allocated = 0;
-	std::cout << "snmalloc:" << std::endl;
+	//std::cout << "snmalloc:" << std::endl;
 	test_allocator_simultaneous_alloc_dealloc<SnMalloc>("snmalloc", max_size, max_mem);
-	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
-	print_process_infos();
+	//std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
+	//print_process_infos();
 
 #endif
 
 #ifdef MICRO_BENCH_MIMALLOC
 	start_compute = false;
 	max_allocated = 0;
-	std::cout << "mimalloc:" << std::endl;
+	//std::cout << "mimalloc:" << std::endl;
 	test_allocator_simultaneous_alloc_dealloc<MiMalloc>("mimalloc", max_size, max_mem);
-	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
-	mi_heap_collect(mi_heap_get_default(), true);
-	print_process_infos();
+	//std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
+	//mi_heap_collect(mi_heap_get_default(), true);
+	//print_process_infos();
 
 #endif
 
 #ifdef USE_TBB
 	start_compute = false;
 	max_allocated = 0;
-	std::cout << "onetbb:" << std::endl;
+	//std::cout << "onetbb:" << std::endl;
 	test_allocator_simultaneous_alloc_dealloc<TBBMalloc>("onetbb", max_size, max_mem);
-	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
-	print_process_infos();
+	//std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
+	//print_process_infos();
 #endif
 
 	

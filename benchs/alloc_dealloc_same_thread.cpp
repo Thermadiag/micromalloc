@@ -100,7 +100,7 @@ void test_allocator(const char* allocator, size_t max_size, size_t max_mem)
 	size_t total_ops = alloc_count * 2;
 	micro_process_infos infos;
 	micro_get_process_infos(&infos);
-	std::cout << "Threads\tOps/s\tMemoryOverhead" << std::endl;
+	//std::cout << "Threads\tOps/s\tMemoryOverhead" << std::endl;
 	double overhead = (infos.peak_rss - additional);
 	overhead /= total;
 
@@ -126,36 +126,6 @@ int alloc_dealloc_same_thread(int, char** const)
 
 	using namespace micro;
 
-	/* struct Big
-	{
-		char data[16];
-	};
-	 {
-		micro::tick();
-		std::list<Big> lst;
-		for (int i = 0; i < 10000000; ++i)
-			lst.emplace_back();
-		size_t el = micro::tock_ms();
-		std::cout << el << std::endl;
-	}
-	{
-		micro::tick();
-		std::list<Big, micro::heap_allocator<Big>> lst;
-		for (int i = 0; i < 10000000; ++i)
-			lst.emplace_back();
-		size_t el = micro::tock_ms();
-		std::cout << el << std::endl;
-	}*/
-
-	// micro_set_parameter(MicroPrintStatsTrigger, 1);
-	// micro_set_string_parameter(MicroPrintStats, "stdout");
-
-
-	// micro_set_parameter( MicroAllowOsPageAlloc, true);
-	// micro_set_parameter( MicroPageMemorySize, 3000000000ull);
-	// micro_set_parameter(MicroSmallAllocThreshold, 500);
-	// micro_set_parameter(MicroSmallAllocThreshold, 0);
-	// micro_set_parameter(MicroBackendMemory, 3000000000ull);
 	unsigned max_size = 0;
 
 
@@ -196,25 +166,25 @@ int alloc_dealloc_same_thread(int, char** const)
 #ifdef MICRO_BENCH_MICROMALLOC
 	start_compute = false;
 	finish_count = 0;
-	std::cout << "micro:" << std::endl;
+	//std::cout << "micro:" << std::endl;
 	test_allocator<Alloc>("micro", max_size, max_mem);
-	print_process_infos();
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_MALLOC
 	start_compute = false;
 	finish_count = 0;
-	std::cout << "malloc:" << std::endl;
+	//std::cout << "malloc:" << std::endl;
 	test_allocator<Malloc>("malloc", max_size, max_mem);
-	print_process_infos();
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_SNMALLOC
 	start_compute = false;
 	finish_count = 0;
-	std::cout << "snmalloc:" << std::endl;
+	//std::cout << "snmalloc:" << std::endl;
 	test_allocator<SnMalloc>("snmalloc", max_size, max_mem);
-	print_process_infos();
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_JEMALLOC
@@ -222,26 +192,26 @@ int alloc_dealloc_same_thread(int, char** const)
 
 	start_compute = false;
 	finish_count = 0;
-	std::cout << "jemalloc:" << std::endl;
+	//std::cout << "jemalloc:" << std::endl;
 	test_allocator<Jemalloc>("jemalloc", max_size, max_mem);
-	print_process_infos();
+	//print_process_infos();
 #endif
 
 #ifdef MICRO_BENCH_MIMALLOC
 	start_compute = false;
 	finish_count = 0;
-	std::cout << "mimalloc:" << std::endl;
+	//std::cout << "mimalloc:" << std::endl;
 	test_allocator<MiMalloc>("mimalloc", max_size, max_mem);
-	print_process_infos();
+	//print_process_infos();
 
 #endif
 
 #ifdef USE_TBB
 	start_compute = false;
 	finish_count = 0;
-	std::cout << "onetbb:" << std::endl;
+	//std::cout << "onetbb:" << std::endl;
 	test_allocator<TBBMalloc>("onetbb", max_size, max_mem);
-	print_process_infos();
+	//print_process_infos();
 #endif
 
 	return 0;
