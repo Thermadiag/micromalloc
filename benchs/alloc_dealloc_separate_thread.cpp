@@ -17,24 +17,38 @@ static std::atomic<size_t> max_allocated{ 0 };
 class Counter
 {
 	std::atomic<size_t> sizes[MAX_THREADS];
+	size_t ops[MAX_THREADS];
 	size_t thread_count;
+
 public:
 	Counter(size_t threads)
 	  : thread_count(threads)
 	{
-		for(size_t i=0; i < thread_count; ++i)
+		for (size_t i = 0; i < thread_count; ++i) {
+			ops[i] = 0;
 			sizes[i] = 0;
+		}
 	}
 
 	size_t add(size_t thread_idx, size_t size)
 	{
+		++ops[thread_idx];
 		sizes[thread_idx] += size;
 		size_t tot = 0;
 		for (size_t i = 0; i < thread_count; ++i)
 			tot += sizes[i].load(std::memory_order_relaxed);
 		return tot;
 	}
-	void sub(size_t thread_idx, size_t size) { sizes[thread_idx] -= size; }
+	void sub(size_t thread_idx, size_t size) { 
+		sizes[thread_idx] -= size;
+		++ops[thread_idx];
+	}
+	size_t total_ops() const {
+		size_t tot = 0;
+		for (size_t i = 0; i < thread_count; ++i)
+			tot += ops[i];
+		return tot;
+	}
 };
 
 
@@ -85,11 +99,12 @@ void test_alloc_dealloc_thread(std::vector<std::atomic<void*>>* ptr, const std::
 	}
 }
 template<class T>
-void test_allocator_simultaneous_alloc_dealloc(const char* allocator, std::vector<unsigned>* sizes, std::vector<std::vector<size_t>>* orders)
+size_t test_allocator_simultaneous_alloc_dealloc(const char* allocator, std::vector<unsigned>* sizes, std::vector<std::vector<size_t>>* orders)
 {
 	std::vector<std::atomic<void*>> ptr(sizes->size());
+	Counter counter(thcount);
 	{
-		Counter counter(thcount);
+		
 		std::fill_n(ptr.begin(), ptr.size(), nullptr);
 
 		std::vector<std::thread> threads(thcount);
@@ -110,6 +125,7 @@ void test_allocator_simultaneous_alloc_dealloc(const char* allocator, std::vecto
 		std::cout << "Interleaved allocation/deallocation in different threads" << std::endl;
 		std::cout << el_alloc << " ms" << std::endl;
 	}
+	return counter.total_ops();
 }
 
 int alloc_dealloc_separate_thread(int, char** const)
@@ -152,6 +168,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 
 	size_t max_mem = 100000000ull;
 	size_t alloc_count = max_mem / (max_size / 2);
+	size_t total_ops = 0;
 
 	std::vector<unsigned> ss(alloc_count);
 	for (size_t i = 0; i < ss.size(); ++i) {
@@ -190,7 +207,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "micro:" << std::endl;
-	test_allocator_simultaneous_alloc_dealloc<Alloc>("micro", &ss, &orders);
+	total_ops = test_allocator_simultaneous_alloc_dealloc<Alloc>("micro", &ss, &orders);
 	micro_clear();
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
@@ -200,7 +217,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "malloc:" << std::endl;
-	test_allocator_simultaneous_alloc_dealloc<Malloc>("malloc", &ss, &orders);
+	total_ops = test_allocator_simultaneous_alloc_dealloc<Malloc>("malloc", &ss, &orders);
 	malloc_trim(0);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
@@ -211,7 +228,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "jemalloc:" << std::endl;
-	test_allocator_simultaneous_alloc_dealloc<Jemalloc>("jemalloc", &ss, &orders);
+	total_ops = test_allocator_simultaneous_alloc_dealloc<Jemalloc>("jemalloc", &ss, &orders);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 #endif
@@ -220,7 +237,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "snmalloc:" << std::endl;
-	test_allocator_simultaneous_alloc_dealloc<SnMalloc>("snmalloc", &ss, &orders);
+	total_ops = test_allocator_simultaneous_alloc_dealloc<SnMalloc>("snmalloc", &ss, &orders);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 
@@ -230,7 +247,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "mimalloc:" << std::endl;
-	test_allocator_simultaneous_alloc_dealloc<MiMalloc>("mimalloc", &ss, &orders);
+	total_ops = test_allocator_simultaneous_alloc_dealloc<MiMalloc>("mimalloc", &ss, &orders);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	mi_heap_collect(mi_heap_get_default(), true);
 	print_process_infos();
@@ -241,7 +258,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "onetbb:" << std::endl;
-	test_allocator_simultaneous_alloc_dealloc<TBBMalloc>("onetbb", &ss, &orders);
+	total_ops = test_allocator_simultaneous_alloc_dealloc<TBBMalloc>("onetbb", &ss, &orders);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 #endif
@@ -253,10 +270,11 @@ int alloc_dealloc_separate_thread(int, char** const)
 
 	micro_process_infos infos;
 	micro_get_process_infos(&infos);
-	std::cout << "Threads: "<<thcount<<std::endl;
-	std::cout << "Peak RSS (MB): " << (infos.peak_rss - additional)/(1024*1024)<< std::endl;
-	std::cout << "Allocated (MB): " << (max_allocated.load()) / (1024 * 1024) << std::endl;
-	std::cout << "Time (s): " << (double)el_alloc / 1000. << std::endl;
+	std::cout << "Threads\tOps/s\tMemoryOverhead"<<std::endl;
+	double overhead = (infos.peak_rss - additional);
+	overhead /= max_allocated.load();
 
+	std::cout << thcount << "\t" << size_t(total_ops / ((double)el_alloc / 1000.)) << "\t" << overhead << std::endl;
+	
 	return 0;
 }
