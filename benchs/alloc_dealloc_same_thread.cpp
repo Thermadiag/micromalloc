@@ -7,6 +7,8 @@
 #include <random>
 #include <list>
 
+#define MAX_THREADS 20
+
 #if defined(MICRO_BENCH_TBB) && defined(NDEBUG)
 #define USE_TBB
 #endif
@@ -35,15 +37,15 @@ static std::atomic<int> finish_count{ 0 };
 static std::atomic<bool> start_compute{ false };
 
 template<class T>
-void alloc_dealloc_thread(std::vector<void*>* ptr, std::vector<unsigned>* sizes, size_t start)
+void alloc_dealloc_thread(size_t count, void** ptr, unsigned* sizes, size_t start)
 {
 	while (!start_compute.load(std::memory_order_relaxed))
 		std::this_thread::yield();
 
-	for (size_t i = start; i < ptr->size(); i += thcount) {
-		if ((*ptr)[i])
+	for (size_t i = start; i < count; i += thcount) {
+		if ((ptr)[i])
 			throw std::runtime_error("");
-		(*ptr)[i] = T::alloc_mem((*sizes)[i]);
+		(ptr)[i] = T::alloc_mem((sizes)[i]);
 	}
 
 	finish_count.fetch_add(1);
@@ -51,21 +53,39 @@ void alloc_dealloc_thread(std::vector<void*>* ptr, std::vector<unsigned>* sizes,
 	while (finish_count.load(std::memory_order_relaxed) != thcount)
 		std::this_thread::yield();
 
-	for (size_t i = start; i < ptr->size(); i += thcount) {
-		if (!(*ptr)[i])
+	for (size_t i = start; i < count; i += thcount) {
+		if (!(ptr)[i])
 			throw std::runtime_error("");
-		T::free_mem((*ptr)[i]);
+		T::free_mem((ptr)[i]);
 	}
 }
 
 template<class T>
-void test_allocator(const char* allocator, std::vector<void*>* ptr, std::vector<unsigned>* sizes)
+void test_allocator(const char* allocator, size_t max_size, size_t max_mem)
 {
+	size_t alloc_count = max_mem / (max_size / 2);
+	size_t total = 0;
+	size_t additional = 0;
 	{
-		std::fill_n(ptr->begin(), ptr->size(), nullptr);
-		std::vector<std::thread> threads(thcount);
+		std::random_device dev;
+		std::mt19937 rng(dev());
+		std::uniform_int_distribution<std::mt19937::result_type> dist(0, max_size); // distribution in range [0, max_size]
+
+		std::vector<void*, micro::testing_allocator<void*,T>> ptr(alloc_count);
+		std::vector<unsigned, micro::testing_allocator<unsigned*, T>> ss(ptr.size());
+
+		for (size_t i = 0; i < ss.size(); ++i) {
+			ss[i] = (unsigned)dist(rng);
+			total += ss[i];
+		}
+
+		additional = ptr.size() * sizeof(void*);
+		additional += ss.size() * sizeof(unsigned);
+
+		std::fill_n(ptr.begin(), ptr.size(), nullptr);
+		std::thread threads[MAX_THREADS];
 		for (size_t i = 0; i < thcount; ++i) {
-			threads[i] = std::thread([&ptr, &sizes, i]() { alloc_dealloc_thread<T>(ptr, sizes, i); });
+			threads[i] = std::thread([&ptr, &ss, i]() { alloc_dealloc_thread<T>(ss.size(), ptr.data(), ss.data(), i); });
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		micro::tick();
@@ -73,16 +93,19 @@ void test_allocator(const char* allocator, std::vector<void*>* ptr, std::vector<
 		for (size_t i = 0; i < thcount; ++i)
 			threads[i].join();
 
-		micro::allocator_trim(allocator);
-		el_alloc = micro::tock_ms();
-
-		size_t bytes = 0;
-		for (unsigned b : *sizes)
-			bytes += b;
-
-		std::cout << "Allocate and deallocate " << bytes << " bytes in the same thread" << std::endl;
-		std::cout << el_alloc << " ms" << std::endl;
+		
 	}
+	micro::allocator_trim(allocator);
+	el_alloc = micro::tock_ms();
+	size_t total_ops = alloc_count * 2;
+	micro_process_infos infos;
+	micro_get_process_infos(&infos);
+	std::cout << "Threads\tOps/s\tMemoryOverhead" << std::endl;
+	double overhead = (infos.peak_rss - additional);
+	overhead /= total;
+
+	std::cout << thcount << "\t" << size_t(total_ops / ((double)el_alloc / 1000.)) << "\t" << overhead << std::endl;
+
 }
 
 int alloc_dealloc_same_thread(int, char** const)
@@ -168,23 +191,13 @@ int alloc_dealloc_same_thread(int, char** const)
 	size_t max_mem = 2000000000ull;
 	size_t alloc_count = max_mem / (max_size / 2);
 
-	std::random_device dev;
-	std::mt19937 rng(dev());
-	std::uniform_int_distribution<std::mt19937::result_type> dist(0, max_size); // distribution in range [0, max_size]
-
-	std::vector<void*> ptr(alloc_count);
-	std::vector<unsigned> ss(ptr.size());
-	size_t total = 0;
-	for (size_t i = 0; i < ss.size(); ++i) {
-		ss[i] = (unsigned)dist(rng);
-		total += ss[i];
-	}
+	
 
 #ifdef MICRO_BENCH_MICROMALLOC
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "micro:" << std::endl;
-	test_allocator<Alloc>("micro", &ptr, &ss);
+	test_allocator<Alloc>("micro", max_size, max_mem);
 	print_process_infos();
 #endif
 
@@ -192,7 +205,7 @@ int alloc_dealloc_same_thread(int, char** const)
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "malloc:" << std::endl;
-	test_allocator<Malloc>("malloc", &ptr, &ss);
+	test_allocator<Malloc>("malloc", max_size, max_mem);
 	print_process_infos();
 #endif
 
@@ -200,7 +213,7 @@ int alloc_dealloc_same_thread(int, char** const)
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "snmalloc:" << std::endl;
-	test_allocator<SnMalloc>("snmalloc", &ptr, &ss);
+	test_allocator<SnMalloc>("snmalloc", max_size, max_mem);
 	print_process_infos();
 #endif
 
@@ -210,7 +223,7 @@ int alloc_dealloc_same_thread(int, char** const)
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "jemalloc:" << std::endl;
-	test_allocator<Jemalloc>("jemalloc", &ptr, &ss);
+	test_allocator<Jemalloc>("jemalloc", max_size, max_mem);
 	print_process_infos();
 #endif
 
@@ -218,7 +231,7 @@ int alloc_dealloc_same_thread(int, char** const)
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "mimalloc:" << std::endl;
-	test_allocator<MiMalloc>("mimalloc", &ptr, &ss);
+	test_allocator<MiMalloc>("mimalloc", max_size, max_mem);
 	print_process_infos();
 
 #endif
@@ -227,15 +240,9 @@ int alloc_dealloc_same_thread(int, char** const)
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "onetbb:" << std::endl;
-	test_allocator<TBBMalloc>("onetbb", &ptr, &ss);
+	test_allocator<TBBMalloc>("onetbb", max_size, max_mem);
 	print_process_infos();
 #endif
-
-	micro_process_infos infos;
-	micro_get_process_infos(&infos);
-	std::cout << "Threads: "<<thcount<<std::endl;
-	std::cout << "Peak RSS (MB): " << (infos.peak_rss - (ptr.size()*sizeof(void*) + ss.size() * sizeof(unsigned)))/(1024*1024)<< std::endl;
-	std::cout << "Time (s): " << (double)el_alloc / 1000. << std::endl;
 
 	return 0;
 }

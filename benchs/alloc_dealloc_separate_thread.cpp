@@ -53,23 +53,23 @@ public:
 
 
 template<class T>
-void test_alloc_dealloc_thread(std::vector<std::atomic<void*>>* ptr, const std::vector<size_t>& order, std::vector<unsigned>* sizes, unsigned thread_idx, Counter * c)
+void test_alloc_dealloc_thread(unsigned count, std::atomic<void*>* ptr, const size_t* order, unsigned* sizes, unsigned thread_idx, Counter* c)
 {
 	while (!start_compute.load(std::memory_order_relaxed))
 		std::this_thread::yield();
 
 	// do 5 passes
 	for (int pass = 0; pass < 5; ++pass)
-	for (size_t i = 0; i < ptr->size(); i++) {
+	for (size_t i = 0; i < count; i++) {
 		size_t idx = (order)[i];
-		void* p = (*ptr)[idx].load(std::memory_order_relaxed);
+		void* p = (ptr)[idx].load(std::memory_order_relaxed);
 		if (!p) {
-			unsigned s = (*sizes)[idx] + 4;
+			unsigned s = (sizes)[idx] + 4;
 			void* m = T::alloc_mem(s);
 			memcpy(m, &s, 4);
 			size_t peak = c->add(thread_idx, s);
 
-			if (!(*ptr)[idx].compare_exchange_strong(p, m)) {
+			if (!(ptr)[idx].compare_exchange_strong(p, m)) {
 				T::free_mem(m);
 				c->sub(thread_idx, s);
 			}
@@ -77,7 +77,7 @@ void test_alloc_dealloc_thread(std::vector<std::atomic<void*>>* ptr, const std::
 				max_allocated.store(peak);
 		}
 		else {
-			void* m = (*ptr)[idx].exchange(nullptr);
+			void* m = (ptr)[idx].exchange(nullptr);
 			if (m) {
 				unsigned s = 0;
 				memcpy(&s, m, 4);
@@ -88,8 +88,8 @@ void test_alloc_dealloc_thread(std::vector<std::atomic<void*>>* ptr, const std::
 	}
 
 	// dealloc all
-	for (size_t i = 0; i < ptr->size(); i++) {
-		void* m = (*ptr)[i].exchange(nullptr);
+	for (size_t i = 0; i <count; i++) {
+		void* m = (ptr)[i].exchange(nullptr);
 		if (m) {
 			unsigned s = 0;
 			memcpy(&s, m, 4);
@@ -99,18 +99,49 @@ void test_alloc_dealloc_thread(std::vector<std::atomic<void*>>* ptr, const std::
 	}
 }
 template<class T>
-size_t test_allocator_simultaneous_alloc_dealloc(const char* allocator, std::vector<unsigned>* sizes, std::vector<std::vector<size_t>>* orders)
+void test_allocator_simultaneous_alloc_dealloc(const char* allocator, size_t max_size, size_t max_mem)
 {
-	std::vector<std::atomic<void*>> ptr(sizes->size());
-	Counter counter(thcount);
+	size_t additional, total_ops;
+
 	{
+
+		std::random_device dev;
+		std::mt19937 rng(dev());
+		std::uniform_int_distribution<std::mt19937::result_type> dist(0, max_size); // distribution in range [0, max_size]
+		size_t alloc_count = max_mem / (max_size / 2);
+
+		std::vector<unsigned, micro::testing_allocator<unsigned, T>> ss(alloc_count);
+		for (size_t i = 0; i < ss.size(); ++i) {
+			ss[i] = dist(rng) % (unsigned)max_size;
+		}
+
+		using size_t_vector = std::vector<size_t, micro::testing_allocator<size_t, T>>;
+		size_t_vector order(ss.size());
+		for (size_t i = 0; i < order.size(); ++i)
+			order[i] = i;
+
+		std::vector<size_t_vector, micro::testing_allocator<size_t_vector, T>> orders(thcount);
+		for (unsigned i = 0; i < thcount; ++i) {
+			orders[i] = order;
+			micro::random_shuffle(orders[i].begin(), orders[i].end(), i);
+		}
+		std::atomic<void*>* ptr = (std::atomic<void*>*) T::alloc_mem(sizeof(std::atomic<void*>) * ss.size());
+		for (size_t i = 0; i < ss.size(); ++i)
+			new (ptr + i) std::atomic<void*>{ nullptr };
+
+		additional = ss.size() * sizeof(unsigned);
+		additional += ss.size() * sizeof(std::atomic<void*>);
+		additional += order.size() * sizeof(size_t);
+		for (size_t i = 0; i < orders.size(); ++i)
+			additional += orders[i].size() * sizeof(size_t);
+
+		Counter counter(thcount);
 		
-		std::fill_n(ptr.begin(), ptr.size(), nullptr);
+		std::thread threads[MAX_THREADS] ;
+		for (size_t i = 0; i < thcount; ++i)
+		{
 
-		std::vector<std::thread> threads(thcount);
-		for (size_t i = 0; i < thcount; ++i) {
-
-			threads[i] = std::thread([&, i]() { test_alloc_dealloc_thread<T>(&ptr, (*orders)[i], sizes, i, &counter); });
+			threads[i] = std::thread([&, i]() { test_alloc_dealloc_thread<T>(ss.size(), ptr, orders[i].data(), ss.data(), i, &counter); });
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		micro::tick();
@@ -118,14 +149,39 @@ size_t test_allocator_simultaneous_alloc_dealloc(const char* allocator, std::vec
 		for (size_t i = 0; i < thcount; ++i)
 			threads[i].join();
 
-		micro::allocator_trim(allocator);
 
-		el_alloc = micro::tock_ms();
+		ss.clear();
+		ss.shrink_to_fit();
 
-		std::cout << "Interleaved allocation/deallocation in different threads" << std::endl;
-		std::cout << el_alloc << " ms" << std::endl;
+		order.clear();
+		order.shrink_to_fit();
+
+		orders.clear();
+		orders.shrink_to_fit();
+
+		T::free_mem(ptr);
+
+		
+
+		// std::cout << "Interleaved allocation/deallocation in different threads" << std::endl;
+		// std::cout << el_alloc << " ms" << std::endl;
+		
+
+		total_ops = counter.total_ops();
 	}
-	return counter.total_ops();
+
+	//micro::allocator_trim(allocator);
+	el_alloc = micro::tock_ms();
+
+	
+
+	micro_process_infos infos;
+	micro_get_process_infos(&infos);
+	std::cout << "Threads\tOps/s\tMemoryOverhead" << std::endl;
+	double overhead = (infos.peak_rss - additional);
+	overhead /= max_allocated.load();
+
+	std::cout << thcount << "\t" << size_t(total_ops / ((double)el_alloc / 1000.)) << "\t" << overhead << std::endl;
 }
 
 int alloc_dealloc_separate_thread(int, char** const)
@@ -167,23 +223,8 @@ int alloc_dealloc_separate_thread(int, char** const)
 	srand(0);
 
 	size_t max_mem = 100000000ull;
-	size_t alloc_count = max_mem / (max_size / 2);
-	size_t total_ops = 0;
-
-	std::vector<unsigned> ss(alloc_count);
-	for (size_t i = 0; i < ss.size(); ++i) {
-		ss[i] = rand() % max_size;
-	}
-
-	std::vector<size_t> order(ss.size());
-	for (size_t i = 0; i < order.size(); ++i)
-		order[i] = i;
-
-	std::vector<std::vector<size_t>> orders(thcount);
-	for (unsigned i = 0; i < thcount; ++i) {
-		orders[i] = order;
-		micro::random_shuffle(orders[i].begin(), orders[i].end(), i);
-	}
+	
+	
 
 	/*start_compute = false;
 	max_allocated = 0;
@@ -207,7 +248,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "micro:" << std::endl;
-	total_ops = test_allocator_simultaneous_alloc_dealloc<Alloc>("micro", &ss, &orders);
+	test_allocator_simultaneous_alloc_dealloc<Alloc>("micro", max_size,max_mem);
 	micro_clear();
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
@@ -217,7 +258,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "malloc:" << std::endl;
-	total_ops = test_allocator_simultaneous_alloc_dealloc<Malloc>("malloc", &ss, &orders);
+	test_allocator_simultaneous_alloc_dealloc<Malloc>("malloc", max_size, max_mem);
 	malloc_trim(0);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
@@ -228,7 +269,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "jemalloc:" << std::endl;
-	total_ops = test_allocator_simultaneous_alloc_dealloc<Jemalloc>("jemalloc", &ss, &orders);
+	test_allocator_simultaneous_alloc_dealloc<Jemalloc>("jemalloc", max_size, max_mem);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 #endif
@@ -237,7 +278,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "snmalloc:" << std::endl;
-	total_ops = test_allocator_simultaneous_alloc_dealloc<SnMalloc>("snmalloc", &ss, &orders);
+	test_allocator_simultaneous_alloc_dealloc<SnMalloc>("snmalloc", max_size, max_mem);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 
@@ -247,7 +288,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "mimalloc:" << std::endl;
-	total_ops = test_allocator_simultaneous_alloc_dealloc<MiMalloc>("mimalloc", &ss, &orders);
+	test_allocator_simultaneous_alloc_dealloc<MiMalloc>("mimalloc", max_size, max_mem);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	mi_heap_collect(mi_heap_get_default(), true);
 	print_process_infos();
@@ -258,23 +299,12 @@ int alloc_dealloc_separate_thread(int, char** const)
 	start_compute = false;
 	max_allocated = 0;
 	std::cout << "onetbb:" << std::endl;
-	total_ops = test_allocator_simultaneous_alloc_dealloc<TBBMalloc>("onetbb", &ss, &orders);
+	test_allocator_simultaneous_alloc_dealloc<TBBMalloc>("onetbb", max_size, max_mem);
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
 #endif
 
-	size_t additional = ss.size() * sizeof(unsigned);
-	additional += order.size() * sizeof(size_t);
-	for(size_t i=0; i < orders.size(); ++i)
-		additional += orders[i].size() * sizeof(size_t);
-
-	micro_process_infos infos;
-	micro_get_process_infos(&infos);
-	std::cout << "Threads\tOps/s\tMemoryOverhead"<<std::endl;
-	double overhead = (infos.peak_rss - additional);
-	overhead /= max_allocated.load();
-
-	std::cout << thcount << "\t" << size_t(total_ops / ((double)el_alloc / 1000.)) << "\t" << overhead << std::endl;
+	
 	
 	return 0;
 }

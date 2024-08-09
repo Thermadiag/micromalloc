@@ -187,6 +187,8 @@ timer_ticks_to_seconds(uint64_t ticks) {
 }
 
 
+#define MAX_THREADS 20
+
 
 typedef void* (*CUSTOM_MALLOC_P)(size_t);
 typedef void (*CUSTOM_FREE_P)(void*);
@@ -204,26 +206,79 @@ int benchmark_thread_initialize(void) {return 0;}
 int benchmark_thread_finalize(void) {return 0;}
 void benchmark_thread_collect(void) {}
 
-static std::atomic<std::uint64_t> bytes;
 static std::atomic<std::uint64_t> peak;
 
+class Counter
+{
+	std::atomic<size_t> sizes[MAX_THREADS];
+	std::atomic<size_t> max_threads;
 
-void* benchmark_malloc(size_t alignment, size_t size) {
+public:
+	void reset() {
+		for (size_t i = 0; i < MAX_THREADS; ++i) {
+			sizes[i] = 0;
+		}
+	}
+	Counter() { reset();}
+
+	size_t add(size_t size)
+	{
+		size_t id = micro::this_thread_id();
+		size_t m = max_threads.load(std::memory_order_relaxed);
+		while (id > m) {
+			if (max_threads.compare_exchange_strong(m, id)) {
+				m = id;
+				break;
+			}
+		}
+		sizes[id] += size;
+		m = max_threads.load(std::memory_order_relaxed);
+		size_t tot = 0;
+		for (size_t i = 0; i <= m; ++i)
+			tot += sizes[i].load(std::memory_order_relaxed);
+		return tot;
+	}
+	void sub(size_t size)
+	{ 
+		sizes[micro::this_thread_id()] -= size;
+	}
+
+	size_t total() const
+	{
+		size_t tot = 0;
+		for (size_t i = 0; i < MAX_THREADS; ++i)
+			tot += sizes[i].load(std::memory_order_relaxed);
+		return tot;
+	}
+};
+
+static Counter counter;
+
+
+void* benchmark_malloc(size_t alignment, size_t size)
+{
+	return CUSTOM_MALLOC(size);
+}
+
+
+void* benchmark_malloc_size(size_t alignment, size_t size) {
 
 	void * p = CUSTOM_MALLOC(size);
-	//bytes += size;
-	/*if (CUSTOM_USABLE) {
-		auto s = CUSTOM_USABLE(p);
-		auto b = bytes.fetch_add(s) + s;
-		if (b > peak.load())
-			peak.store(b);
-	}*/
+	/**(uint32_t*)p = (unsigned)size;
+	size_t max = counter.add(size);
+	if (max > peak.load(std::memory_order_relaxed))
+		peak.store(max);
+	*/
 	return p;
 }
 
 void benchmark_free(void* ptr) {
-	if(CUSTOM_USABLE)
-		bytes.fetch_sub(CUSTOM_USABLE(ptr));
+	CUSTOM_FREE(ptr);
+}
+
+void benchmark_free_size(void* ptr)
+{
+	//counter.sub(*(uint32_t*)ptr);
 	CUSTOM_FREE(ptr);
 }
 
@@ -593,7 +648,7 @@ benchmark_worker(void* argptr) {
 			for (iop = 0; iop < free_op_count; ++iop) {
 				if (pointers[free_idx]) {
 					allocated -= *(int32_t*)pointers[free_idx];
-					benchmark_free(pointers[free_idx]);
+					benchmark_free_size(pointers[free_idx]);
 					++arg->mops;
 					pointers[free_idx] = 0;
 				}
@@ -605,7 +660,7 @@ benchmark_worker(void* argptr) {
 				int32_t foreign_allocated = 0;
 				for (iop = 0; iop < foreign->count; ++iop) {
 					foreign_allocated -= *(int32_t*)foreign->pointers[iop];
-					benchmark_free(foreign->pointers[iop]);//ERROR wityh cross_count non 0
+					benchmark_free_size(foreign->pointers[iop]); // ERROR wityh cross_count non 0
 					++arg->mops;
 				}
 
@@ -621,13 +676,13 @@ benchmark_worker(void* argptr) {
 			for (iop = 0; iop < alloc_op_count; ++iop) {
 				if (pointers[alloc_idx]) {
 					allocated -= *(int32_t*)pointers[alloc_idx];
-					benchmark_free(pointers[alloc_idx]);
+					benchmark_free_size(pointers[alloc_idx]);
 					++arg->mops;
 				}
 				size_t size = arg->min_size;
 				if (arg->mode == MODE_RANDOM)
 					size = random_size_arr[(size_index + 2) % random_size_count];
-				pointers[alloc_idx] = benchmark_malloc((size < 4096) ? alignment[(size_index + iop) % 3] : 0, size);
+				pointers[alloc_idx] = benchmark_malloc_size((size < 4096) ? alignment[(size_index + iop) % 3] : 0, size);
 				//Make sure to write to each page to commit it for measuring memory usage
 				*(int32_t*)pointers[alloc_idx] = (int32_t)size;
 				size_t num_pages = (size - 1) / 4096;
@@ -654,7 +709,7 @@ benchmark_worker(void* argptr) {
 					size_t size = arg->min_size;
 					if (arg->mode == MODE_RANDOM)
 						size = random_size_arr[(size_index + 2) % random_size_count];
-					foreign->pointers[iop] = benchmark_malloc((size < 4096) ? alignment[(size_index + iop) % 3] : 0, size);
+					foreign->pointers[iop] = benchmark_malloc_size((size < 4096) ? alignment[(size_index + iop) % 3] : 0, size);
 					*(int32_t*)foreign->pointers[iop] = (int32_t)size;
 					size_t num_pages = (size - 1) / 4096;
 					for (size_t page = 1; page < num_pages; ++page)
@@ -731,7 +786,7 @@ benchmark_worker(void* argptr) {
 					allocated = 0;
 					for (iop = 0; iop < foreign->count; ++iop) {
 						allocated -= *(int32_t*)foreign->pointers[iop];
-						benchmark_free(foreign->pointers[iop]);
+						benchmark_free_size(foreign->pointers[iop]);
 						++arg->mops;
 					}
 
@@ -756,7 +811,7 @@ benchmark_worker(void* argptr) {
 		for (size_t iptr = 0; iptr < arg->alloc_count; ++iptr) {
 			if (pointers[iptr]) {
 				allocated -= *(int32_t*)pointers[iptr];
-				benchmark_free(pointers[iptr]);
+				benchmark_free_size(pointers[iptr]);
 				++arg->mops;
 				pointers[iptr] = 0;
 			}
@@ -772,7 +827,7 @@ benchmark_worker(void* argptr) {
 		foreign = get_cross_thread_memory(&arg->foreign);
 		while (foreign) {
 			for (iop = 0; iop < foreign->count; ++iop)
-				benchmark_free(foreign->pointers[iop]);
+				benchmark_free_size(foreign->pointers[iop]);
 
 			void* next = foreign->next;
 			benchmark_free(foreign->pointers);
@@ -802,7 +857,7 @@ benchmark_worker(void* argptr) {
 				allocated = 0;
 				for (iop = 0; iop < foreign->count; ++iop) {
 					allocated -= *(int32_t*)foreign->pointers[iop];
-					benchmark_free(foreign->pointers[iop]);
+					benchmark_free_size(foreign->pointers[iop]);
 					++arg->mops;
 				}
 
@@ -1156,21 +1211,20 @@ rptest(int argc, char** const argv) {
 		//micro_set_parameter(MicroPrintStatsTrigger, 1);
 		//micro_set_parameter(MicroSmallAllocThreshold, 512);
 		//micro_set_string_parameter(MicroPrintStats, "stdout");
-		bytes = 0;
+		 counter.reset();
+		peak = 0;
 		CUSTOM_MALLOC = micro_malloc;
 		CUSTOM_FREE = micro_free;
 		CUSTOM_REALLOC = micro_realloc;
 		CUSTOM_USABLE = nullptr;//micro_usable_size;
 		CUSTOM_NAME = "micro";
 		benchmark_run(argc, argv, false);
-		
-		peak = bytes = 0;
-		//return 0;
 	}
 #endif
 
 #ifdef MICRO_BENCH_MALLOC
-	bytes = 0;
+	counter.reset();
+	peak = 0;
 	CUSTOM_MALLOC = malloc;
 	CUSTOM_FREE = free;
 	CUSTOM_REALLOC = realloc;
@@ -1180,7 +1234,8 @@ rptest(int argc, char** const argv) {
 #endif
 	
 #ifdef MICRO_BENCH_JEMALLOC
-	bytes = 0;
+	counter.reset();
+	peak = 0;
 	//const char* je_malloc_conf = "dirty_decay_ms:0";
 	CUSTOM_MALLOC = je_malloc;
 	CUSTOM_FREE = je_free;
@@ -1191,7 +1246,8 @@ rptest(int argc, char** const argv) {
 #endif
 	
 #ifdef MICRO_BENCH_MIMALLOC
-	bytes = 0;
+	counter.reset();
+	peak = 0;
 	CUSTOM_MALLOC = mi_malloc;
 	CUSTOM_FREE = mi_free;
 	CUSTOM_REALLOC = mi_realloc;
@@ -1201,7 +1257,8 @@ rptest(int argc, char** const argv) {
 #endif
 
 #ifdef MICRO_BENCH_SNMALLOC
-	bytes = 0;
+	counter.reset();
+	peak = 0;
 	CUSTOM_MALLOC = snmalloc::libc::malloc;;
 	CUSTOM_FREE = snmalloc::libc::free;
 	CUSTOM_REALLOC = snmalloc::libc::realloc;
@@ -1211,7 +1268,8 @@ rptest(int argc, char** const argv) {
 #endif
 
 #ifdef USE_TBB
-	bytes = 0;
+	counter.reset();
+	peak = 0;
 	CUSTOM_MALLOC = scalable_malloc;
 	CUSTOM_FREE = scalable_free;
 	CUSTOM_REALLOC = scalable_realloc;
