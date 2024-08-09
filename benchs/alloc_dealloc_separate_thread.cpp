@@ -5,6 +5,8 @@
 #include <thread>
 #include <iostream>
 
+#define MAX_THREADS 20
+
 static size_t el_alloc=0;
 static size_t thcount{ 0 };
 static std::atomic<int> finish_count{ 0 };
@@ -14,19 +16,21 @@ static std::atomic<size_t> max_allocated{ 0 };
 
 class Counter
 {
-	std::vector<std::atomic<size_t>> sizes;
-
+	std::atomic<size_t> sizes[MAX_THREADS];
+	size_t thread_count;
 public:
 	Counter(size_t threads)
-	  : sizes(threads, 0)
+	  : thread_count(threads)
 	{
+		for(size_t i=0; i < thread_count; ++i)
+			sizes[i] = 0;
 	}
 
 	size_t add(size_t thread_idx, size_t size)
 	{
 		sizes[thread_idx] += size;
 		size_t tot = 0;
-		for (size_t i = 0; i < sizes.size(); ++i)
+		for (size_t i = 0; i < thread_count; ++i)
 			tot += sizes[i].load(std::memory_order_relaxed);
 		return tot;
 	}
@@ -126,6 +130,8 @@ int alloc_dealloc_separate_thread(int, char** const)
 #else
 	thcount = MICRO_TEST_THREAD;
 #endif
+	if(thcount > MAX_THREADS)
+		thcount = MAX_THREADS;
 
 #ifndef MICRO_TEST_SIZE
 	const char * MICRO_TEST_SIZE = std::getenv("MICRO_TEST_SIZE");
