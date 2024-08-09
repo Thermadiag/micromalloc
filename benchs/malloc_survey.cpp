@@ -248,8 +248,12 @@ int malloc_survey(int, char** const)
         enum { none = 0, single = 1, thread = 2, all = ~0 };
         // some suites got single only because... { - they crashed, or; - they deadlocked, or; - they took more than 30 secs to finish }
 
+#ifdef MICRO_BENCH_MICROMALLOC
         benchmark_suite< std::list<int, micro::heap_allocator<int> >>(all, "micro");
+#endif
+#ifdef MICRO_BENCH_MALLOC
         benchmark_suite< std::list<int, std::allocator<int> >>(all, "malloc");
+#endif
 #ifdef MICRO_BENCH_JEMALLOC
         benchmark_suite< std::list<int, micro::testing_allocator<int, micro::Jemalloc> >>(all, "jemalloc");
 #endif

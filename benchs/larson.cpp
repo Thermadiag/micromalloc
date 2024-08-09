@@ -665,7 +665,7 @@ DoneWithInput:
         return(1);
     }
 
-
+#ifdef MICRO_BENCH_MICROMALLOC
      {
        
         std::cout << "Larson micro_malloc:" << std::endl;
@@ -686,6 +686,8 @@ DoneWithInput:
         delete p;
         micro::print_process_infos();
     }
+#endif
+
 #ifdef MICRO_BENCH_MALLOC
     {
         std::cout << "Larson malloc:" << std::endl;

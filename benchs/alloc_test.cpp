@@ -874,10 +874,13 @@ public:
 
 int alloc_test(int, char** const)
 {
+#ifdef MICRO_BENCH_MICROMALLOC
 	CURRENT_NAME = "micro";
 	runTest<Allocator<micro::Alloc>>();
-
+#endif
+#ifdef MICRO_BENCH_MALLOC
 	CURRENT_NAME = "malloc";
+#endif
 	runTest<Allocator<micro::Malloc>>();
 #ifdef MICRO_BENCH_JEMALLOC
 	CURRENT_NAME = "jemalloc";

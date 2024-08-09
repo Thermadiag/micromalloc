@@ -229,6 +229,7 @@ int mstress(int argc, char** const argv) {
     }
     printf("start with %d threads with a %d%% load-per-thread and %d iterations\n", THREADS, SCALE, ITER);
    
+#ifdef MICRO_BENCH_MICROMALLOC
     {
         //micro_set_parameter(MicroProviderType, MicroOSPreallocProvider);
         //micro_set_parameter(MicroAllowOsPageAlloc, 1);
@@ -241,7 +242,7 @@ int mstress(int argc, char** const argv) {
         launch_test("micro");
         //return 0;
     }
-
+#endif
 
 
 #ifdef MICRO_BENCH_MALLOC

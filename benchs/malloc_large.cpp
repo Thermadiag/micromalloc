@@ -66,6 +66,7 @@ static int bench(const char * name) {
 
 int malloc_large(int,  char** const)
 {
+#ifdef MICRO_BENCH_MICROMALLOC
     {
         //micro_set_parameter(MicroProviderType, MicroOSPreallocProvider);
         //micro_set_parameter(MicroAllowOsPageAlloc, 1);
@@ -76,6 +77,7 @@ int malloc_large(int,  char** const)
         CUSTOM_FREE = micro_free;
         bench("micro");
     }
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
     CUSTOM_MALLOC = malloc;

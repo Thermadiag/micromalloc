@@ -1129,6 +1129,7 @@ rptest(int argc, char** const argv) {
 
 	benchmark_run(0, nullptr,true);
 	
+#ifdef MICRO_BENCH_MICROMALLOC
 	 {
 		//micro_set_parameter(MicroProviderType, MicroOSPreallocProvider);
 		//micro_set_parameter(MicroAllowOsPageAlloc, 1);
@@ -1149,6 +1150,7 @@ rptest(int argc, char** const argv) {
 		peak = bytes = 0;
 		//return 0;
 	}
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
 	bytes = 0;

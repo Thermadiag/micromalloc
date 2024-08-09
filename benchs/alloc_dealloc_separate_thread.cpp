@@ -145,6 +145,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	// micro_set_parameter( MicroAllowOsPageAlloc, true);
 	// micro_set_parameter( MicroPageMemorySize, 3000000000ull);
 
+#ifdef MICRO_BENCH_MICROMALLOC
 	start_compute = false;
 	max_allocated = 0;
 	allocated = 0;
@@ -153,6 +154,7 @@ int alloc_dealloc_separate_thread(int, char** const)
 	micro_clear();
 	std::cout << "Peak allocation: " << max_allocated.load() << std::endl;
 	print_process_infos();
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
 	start_compute = false;

@@ -164,7 +164,7 @@ int bench(const char * name)
 
 int cache_scratch(int, char** const)
 {
-
+#ifdef MICRO_BENCH_MICROMALLOC
     {
         //micro_set_parameter(MicroProviderType, MicroOSPreallocProvider);
         //micro_set_parameter(MicroAllowOsPageAlloc, 1);
@@ -176,6 +176,7 @@ int cache_scratch(int, char** const)
         bench("micro");
         micro_clear();
     }
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
     CUSTOM_MALLOC = malloc;

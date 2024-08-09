@@ -317,10 +317,11 @@ int xmalloc(int, char** const)
 
 	//micro_set_parameter(MicroPrintStatsTrigger, 1);
 	//micro_set_string_parameter(MicroPrintStats, "stdout");
-
+#ifdef MICRO_BENCH_MICROMALLOC
 	CUSTOM_MALLOC = micro_malloc;
 	CUSTOM_FREE = micro_free;
 	test_xmallox("micro");
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
 	CUSTOM_MALLOC = malloc;

@@ -53,7 +53,10 @@ if(MICRO_NO_FILE_MAPPING)
 endif()
 
 target_compile_definitions(micro_benchs PRIVATE MICRO_MEMORY_LEVEL=${MICRO_MEMORY_LEVEL})
-	
+
+if(MICRO_BENCH_MICROMALLOC)
+	target_compile_definitions(micro_benchs PRIVATE -DMICRO_BENCH_MICROMALLOC)
+endif()
 
 # Configure mimalloc
 IF(MICRO_BENCH_MIMALLOC)

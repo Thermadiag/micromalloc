@@ -78,10 +78,12 @@ int alloc_growing_size(int, char** const)
 	// micro_set_string_parameter(MicroPrintStats, "stdout");
 	// micro_set_parameter(MicroPrintStatsTrigger, MicroOnExit);
 
+#ifdef MICRO_BENCH_MICROMALLOC
 	std::cout << "micro:" << std::endl;
 	test_growing<Alloc>("micro", &ss);
 	micro_clear();
 	print_process_infos();
+#endif
 
 	// return 0;
 

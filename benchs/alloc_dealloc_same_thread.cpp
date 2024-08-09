@@ -169,11 +169,13 @@ int alloc_dealloc_same_thread(int, char** const)
 		total += ss[i];
 	}
 
+#ifdef MICRO_BENCH_MICROMALLOC
 	start_compute = false;
 	finish_count = 0;
 	std::cout << "micro:" << std::endl;
 	test_allocator<Alloc>("micro", &ptr, &ss);
 	print_process_infos();
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
 	start_compute = false;

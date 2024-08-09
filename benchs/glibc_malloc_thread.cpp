@@ -259,6 +259,7 @@ static int bench(const char * name)
 
 int glibc_malloc_thread(int, char** const)
 {
+#ifdef MICRO_BENCH_MICROMALLOC
     {
         //micro_set_parameter(MicroProviderType, MicroOSPreallocProvider);
         //micro_set_parameter(MicroAllowOsPageAlloc, 1);
@@ -270,6 +271,7 @@ int glibc_malloc_thread(int, char** const)
         CUSTOM_REALLOC = micro_realloc;
         bench("micro");
     }
+#endif
 
 #ifdef MICRO_BENCH_MALLOC
 
