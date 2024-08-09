@@ -14,7 +14,7 @@ static std::atomic<size_t> max_allocated{ 0 };
 
 class Counter
 {
-	std::vector<size_t> sizes;
+	std::vector<std::atomic<size_t>> sizes;
 
 public:
 	Counter(size_t threads)
@@ -27,7 +27,7 @@ public:
 		sizes[thread_idx] += size;
 		size_t tot = 0;
 		for (size_t i = 0; i < sizes.size(); ++i)
-			tot += sizes[i];
+			tot += sizes[i].load(std::memory_order_relaxed);
 		return tot;
 	}
 	void sub(size_t thread_idx, size_t size) { sizes[thread_idx] -= size; }
