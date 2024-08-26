@@ -124,7 +124,7 @@ struct lran2_st {
 
 
 static micro::op_counter < MAX_THREADS>* counter = nullptr;
-
+static int thcount = 0;
 
 struct Params
 {
@@ -450,7 +450,9 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
 
         double throughput = (double)sum_allocs / duration;
         double rtime = 1.0e9 / throughput;
-        printf("Throughput = %8.0f operations per second, relative time: %.3fs.\n", throughput, rtime);
+        //printf("Throughput = %8.0f operations per second, relative time: %.3fs.\n", throughput, rtime);
+
+        printf("%d\t%8.0f\n", thcount, throughput);
 
 
 #if 0
@@ -466,7 +468,7 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
 
         prevthreads = p->num_threads;
 
-        printf("Done sleeping...\n");
+        //printf("Done sleeping...\n");
 
     }
 
@@ -477,7 +479,7 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
 	    micro_get_process_infos(&infos);
 	    double overhead = (infos.peak_rss - sizeof(Params));
 	    overhead /= (double)counter->memory_peak();
-	    printf("Memory overhead: %f\n", overhead);
+	    //printf("Memory overhead: %f\n", overhead);
     }
 }
 
@@ -651,7 +653,21 @@ int larson(int argc, char* argv[])
     //  char * dummy = new char[42];
        //ReferenceLibHoard();
 #if defined(_MT) || defined(_REENTRANT)
-    int          min_threads = 10, max_threads = 10;
+
+    #ifdef MICRO_TEST_THREAD
+    int min_threads = MICRO_TEST_THREAD, max_threads = MICRO_TEST_THREAD;
+    #else
+    int min_threads, max_threads;
+    const char* MICRO_TEST_THREAD = std::getenv("MICRO_TEST_THREAD");
+    if (MICRO_TEST_THREAD) {
+	    min_threads = max_threads = micro::detail::from_string<int>(MICRO_TEST_THREAD);
+	    if (min_threads == 0)
+		    min_threads = max_threads = 10;
+    }
+    else {
+	    min_threads = max_threads = 10;
+    }
+    #endif
     int          num_rounds = 10;
     int          chperthread = 10;
 #endif
@@ -660,8 +676,10 @@ int larson(int argc, char* argv[])
     long sleep_cnt = 1;
     int          min_size = 10, max_size = 500;
 
-    micro::op_counter<MAX_THREADS> cnt;
-    counter = &cnt;
+    thcount = min_threads;
+
+    //micro::op_counter<MAX_THREADS> cnt;
+   // counter = &cnt;
 
     if (argc > 7) {
         sleep_cnt = atoi(argv[1]);
@@ -677,33 +695,6 @@ int larson(int argc, char* argv[])
 
     
 
-    /*
-#if defined(_MT) || defined(_REENTRANT)
-    //#ifdef _MT
-    printf("\nMulti-threaded test driver \n");
-#else
-    printf("\nSingle-threaded test driver \n");
-#endif
-
-    printf("C version (malloc and free)\n");
-    printf("runtime (sec): ");
-    scanf("%ld", &sleep_cnt);
-
-    printf("chunk size (min,max): ");
-    scanf("%d %d", &min_size, &max_size);
-#if defined(_MT) || defined(_REENTRANT)
-    //#ifdef _MT
-    printf("threads (min, max):   ");
-    scanf("%d %d", &min_threads, &max_threads);
-    printf("chunks/thread:  "); scanf("%d", &chperthread);
-    printf("no of rounds:   "); scanf("%d", &num_rounds);
-    num_chunks = max_threads * chperthread;
-#else
-    printf("no of chunks:  "); scanf("%d", &num_chunks);
-#endif
-    printf("random seed:    "); scanf("%d", &seed);
-
-    */
 DoneWithInput:
 
     if (num_chunks > MAX_BLOCKS) {
@@ -714,7 +705,7 @@ DoneWithInput:
 #ifdef MICRO_BENCH_MICROMALLOC
      {
        
-        std::cout << "Larson micro_malloc:" << std::endl;
+        //std::cout << "Larson micro_malloc:" << std::endl;
 	    Params* p = get_params();
         p->name = "micro";
         p->min_size = min_size;
@@ -729,13 +720,13 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        micro::print_process_infos();
+        //micro::print_process_infos();
     }
 #endif
 
 #ifdef MICRO_BENCH_MALLOC
     {
-        std::cout << "Larson malloc:" << std::endl;
+        //std::cout << "Larson malloc:" << std::endl;
 	    Params* p = get_params();
         p->name = "malloc";
         p->min_size = min_size;
@@ -750,14 +741,14 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        micro::print_process_infos();
+        //micro::print_process_infos();
     }
 #endif
 
 #ifdef MICRO_BENCH_JEMALLOC
     {
         //const char* je_malloc_conf = "dirty_decay_ms:0";
-        std::cout << "Larson jemalloc:" << std::endl;
+        //std::cout << "Larson jemalloc:" << std::endl;
 	Params* p = get_params();
         p->name = "jemalloc";
         p->min_size = min_size;
@@ -772,7 +763,7 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        micro::print_process_infos();
+        //micro::print_process_infos();
 
     }
 #endif
@@ -780,7 +771,7 @@ DoneWithInput:
 
 #ifdef MICRO_BENCH_SNMALLOC
     {
-        std::cout << "Larson snmalloc:" << std::endl;
+        //std::cout << "Larson snmalloc:" << std::endl;
 	    Params* p = get_params();
         p->name = "snmalloc";
         p->min_size = min_size;
@@ -795,14 +786,14 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        micro::print_process_infos();
+        //micro::print_process_infos();
 
     }
 #endif
 
 #ifdef MICRO_BENCH_MIMALLOC
     {
-        std::cout << "Larson mimalloc:" << std::endl;
+       // std::cout << "Larson mimalloc:" << std::endl;
 	    Params* p = get_params();
         p->name = "mimalloc";
         p->min_size = min_size;
@@ -817,7 +808,7 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        micro::print_process_infos();
+        //micro::print_process_infos();
         
     }
 #endif
@@ -825,7 +816,7 @@ DoneWithInput:
 
 #ifdef USE_TBB
     {
-        std::cout << "Larson onetbb:" << std::endl;
+        //std::cout << "Larson onetbb:" << std::endl;
 	    Params* p = get_params();
         p->name = "onetbb";
         p->min_size = min_size;
@@ -840,7 +831,7 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        micro::print_process_infos();
+        //micro::print_process_infos();
     }
 #endif
 

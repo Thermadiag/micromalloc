@@ -150,7 +150,7 @@ void test_allocator_simultaneous_alloc_dealloc(const char* allocator, size_t max
 
 	std::cout << thcount << "\t" << size_t(total_ops / ((double)el_alloc / 1000.)) << "\t" << overhead << std::endl;
 
-	std::cout << "Peak allocation: " << counter.memory_peak() << std::endl;
+	//std::cout << "Peak allocation: " << counter.memory_peak() << std::endl;
 }
 
 int alloc_dealloc_separate_thread(int, char** const)
