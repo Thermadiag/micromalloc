@@ -678,10 +678,21 @@ int larson(int argc, char* argv[])
     long sleep_cnt = 1;
     int          min_size = 10, max_size = 500;
 
+    #ifdef MICRO_TEST_SIZE
+    max_size = MICRO_TEST_SIZE;
+    #else
+    const char* MICRO_TEST_SIZE = std::getenv("MICRO_TEST_SIZE");
+    if (MICRO_TEST_SIZE) {
+	    max_size = micro::detail::from_string<int>(MICRO_TEST_SIZE);
+	    if (max_size == 0)
+		    max_size = 500;
+    }
+    #endif
+
     thcount = min_threads;
 
-    micro::op_counter<MAX_THREADS> cnt;
-    counter = &cnt;
+    //micro::op_counter<MAX_THREADS> cnt;
+    //counter = &cnt;
 
     if (argc > 7) {
         sleep_cnt = atoi(argv[1]);
