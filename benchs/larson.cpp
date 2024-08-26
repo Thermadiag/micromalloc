@@ -452,7 +452,15 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
         double rtime = 1.0e9 / throughput;
         //printf("Throughput = %8.0f operations per second, relative time: %.3fs.\n", throughput, rtime);
 
-        printf("%d\t%8.0f\n", thcount, throughput);
+        if (counter) {
+		    micro_process_infos infos;
+		    micro_get_process_infos(&infos);
+		    double overhead = (infos.peak_rss - sizeof(Params));
+		    overhead /= (double)counter->memory_peak();
+		    printf("%d\t%8.0f\t%f\n", thcount, throughput, overhead);
+	    }
+	    else
+            printf("%d\t%8.0f\n", thcount, throughput);
 
 
 #if 0
@@ -474,13 +482,7 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
 
     micro::allocator_trim(p->name);
 
-    if (counter) {
-	    micro_process_infos infos;
-	    micro_get_process_infos(&infos);
-	    double overhead = (infos.peak_rss - sizeof(Params));
-	    overhead /= (double)counter->memory_peak();
-	    //printf("Memory overhead: %f\n", overhead);
-    }
+    
 }
 
 
@@ -678,8 +680,8 @@ int larson(int argc, char* argv[])
 
     thcount = min_threads;
 
-    //micro::op_counter<MAX_THREADS> cnt;
-   // counter = &cnt;
+    micro::op_counter<MAX_THREADS> cnt;
+    counter = &cnt;
 
     if (argc > 7) {
         sleep_cnt = atoi(argv[1]);
