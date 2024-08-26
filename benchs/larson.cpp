@@ -123,23 +123,44 @@ struct lran2_st {
 
 
 
+static micro::op_counter < MAX_THREADS>* counter = nullptr;
+
+
 struct Params
 {
-    typedef void* (*malloc_type)(size_t);
-    typedef void (*free_type)(void*);
+	typedef void* (*malloc_type)(size_t);
+	typedef void (*free_type)(void*);
 
-    malloc_type _malloc;
-    free_type _free;
-    const char* name;
+	malloc_type _malloc;
+	free_type _free;
+	const char* name;
 
-    int volatile  stopflag = FALSE;
-    char* blkp[MAX_BLOCKS];
-    size_t          blksize[MAX_BLOCKS];
-    long            seqlock = 0;
-    struct lran2_st rgen;
-    int             min_size = 10, max_size = 500;
-    int             num_threads;
+	int volatile stopflag = FALSE;
+	char* blkp[MAX_BLOCKS];
+	size_t blksize[MAX_BLOCKS];
+	long seqlock = 0;
+	struct lran2_st rgen;
+	int min_size = 10, max_size = 500;
+	int num_threads;
+
+	void* larson_malloc(size_t s)
+	{
+		if (void* r = _malloc(s)) {
+			if (counter)
+				counter->allocate(s);
+			return r;
+		}
+		return nullptr;
+	}
+	void larson_free(void* p, size_t s)
+	{
+		if (counter)
+			counter->deallocate(s);
+		_free(p);
+	}
 };
+
+
 
 void warmup(Params* p, char** blkp, int num_chunks);
 void* exercise_heap(void* pinput);
@@ -259,7 +280,7 @@ static void runloops(Params* p, long sleep_cnt, int num_chunks)
             blk_size = p->min_size + lran2(&p->rgen) % (p->max_size - p->min_size);
         }
 
-        p->blkp[cblks] = (char*)p->_malloc(blk_size);
+        p->blkp[cblks] = (char*)p->larson_malloc(blk_size);
         p->blksize[cblks] = blk_size;
         assert(p->blkp[cblks] != nullptr);
     }
@@ -268,7 +289,7 @@ static void runloops(Params* p, long sleep_cnt, int num_chunks)
         for (cblks = 0; cblks < num_chunks; cblks++) {
             victim = lran2(&p->rgen) % num_chunks;
 
-            p->_free(p->blkp[victim]);
+            p->larson_free(p->blkp[victim], p->blksize[cblks]);
 
             if (p->max_size == p->min_size) {
                 blk_size = p->min_size;
@@ -277,7 +298,7 @@ static void runloops(Params* p, long sleep_cnt, int num_chunks)
                 blk_size = p->min_size + lran2(&p->rgen) % (p->max_size - p->min_size);
             }
 
-            p->blkp[victim] = (char*)p->_malloc(blk_size);
+            p->blkp[victim] = (char*)p->larson_malloc(blk_size);
             p->blksize[victim] = blk_size;
             assert(p->blkp[victim] != nullptr);
         }
@@ -330,6 +351,9 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
     int           i;
 
     QueryPerformanceFrequency(&ticks_per_sec);
+
+    if (counter)
+	    counter->reset();
 
     pdea = &de_area[0];
     memset(&de_area[0], 0, sizeof(thread_data));
@@ -447,6 +471,14 @@ static void runthreads(Params* p, long sleep_cnt, int min_threads, int max_threa
     }
 
     micro::allocator_trim(p->name);
+
+    if (counter) {
+	    micro_process_infos infos;
+	    micro_get_process_infos(&infos);
+	    double overhead = (infos.peak_rss - sizeof(Params));
+	    overhead /= (double)counter->memory_peak();
+	    printf("Memory overhead: %f\n", overhead);
+    }
 }
 
 
@@ -471,7 +503,7 @@ void* exercise_heap( void* pinput)
     for (cblks = 0; cblks < pdea->NumBlocks; cblks++) {
         victim = lran2(&pdea->rgen) % pdea->asize;
 
-        p->_free(pdea->array[victim]);
+        p->larson_free(pdea->array[victim], pdea->blksize[victim]);
         pdea->cFrees++;
 
         if (range == 0) {
@@ -481,7 +513,7 @@ void* exercise_heap( void* pinput)
             blk_size = pdea->min_size + lran2(&pdea->rgen) % range;
         }
 
-        pdea->array[victim] = (char*)p->_malloc(blk_size);
+        pdea->array[victim] = (char*)p->larson_malloc(blk_size);
 
         pdea->blksize[victim] = blk_size;
         assert(pdea->array[victim] != nullptr);
@@ -540,7 +572,7 @@ void warmup(Params* p, char** blkp, int num_chunks)
             blk_size = p->min_size + lran2(&p->rgen) % (p->max_size - p->min_size);
         }
 
-        blkp[cblks] = (char*)p->_malloc(blk_size);
+        blkp[cblks] = (char*)p->larson_malloc(blk_size);
         p->blksize[cblks] = blk_size;
         assert(blkp[cblks] != nullptr);
     }
@@ -559,7 +591,7 @@ void warmup(Params* p, char** blkp, int num_chunks)
     for (cblks = 0; cblks < 4 * num_chunks; cblks++) {
         victim = lran2(&p->rgen) % num_chunks;
 
-        p->_free(blkp[victim]);
+        p->larson_free(blkp[victim], p->blksize[victim]);
 
         if (p->max_size == p->min_size) {
             blk_size = p->min_size;
@@ -568,7 +600,7 @@ void warmup(Params* p, char** blkp, int num_chunks)
             blk_size = p->min_size + lran2(&p->rgen) % (p->max_size - p->min_size);
         }
 
-        blkp[victim] = (char*)p->_malloc(blk_size);
+        blkp[victim] = (char*)p->larson_malloc(blk_size);
         p->blksize[victim] = blk_size;
         assert(blkp[victim] != nullptr);
     }
@@ -602,7 +634,16 @@ static ULONG CountReservedSpace()
 #endif
 
 
-
+static Params* get_params()
+{
+	struct Init
+	{
+		Init(Params* pp) { memset(pp, 0, sizeof(Params));}
+	};
+	static Params p;
+	static Init init(&p);
+	return &p;
+}
 
 int larson(int argc, char* argv[])
 {
@@ -619,6 +660,9 @@ int larson(int argc, char* argv[])
     long sleep_cnt = 1;
     int          min_size = 10, max_size = 500;
 
+    micro::op_counter<MAX_THREADS> cnt;
+    counter = &cnt;
+
     if (argc > 7) {
         sleep_cnt = atoi(argv[1]);
         min_size = atoi(argv[2]);
@@ -630,6 +674,8 @@ int larson(int argc, char* argv[])
         min_threads = max_threads;
         goto DoneWithInput;
     }
+
+    
 
     /*
 #if defined(_MT) || defined(_REENTRANT)
@@ -669,7 +715,7 @@ DoneWithInput:
      {
        
         std::cout << "Larson micro_malloc:" << std::endl;
-        Params* p = new Params();
+	    Params* p = get_params();
         p->name = "micro";
         p->min_size = min_size;
         p->max_size = max_size;
@@ -683,7 +729,6 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        delete p;
         micro::print_process_infos();
     }
 #endif
@@ -691,7 +736,7 @@ DoneWithInput:
 #ifdef MICRO_BENCH_MALLOC
     {
         std::cout << "Larson malloc:" << std::endl;
-        Params* p = new Params();
+	    Params* p = get_params();
         p->name = "malloc";
         p->min_size = min_size;
         p->max_size = max_size;
@@ -705,7 +750,6 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        delete p;
         micro::print_process_infos();
     }
 #endif
@@ -714,7 +758,7 @@ DoneWithInput:
     {
         //const char* je_malloc_conf = "dirty_decay_ms:0";
         std::cout << "Larson jemalloc:" << std::endl;
-        Params* p = new Params();
+	Params* p = get_params();
         p->name = "jemalloc";
         p->min_size = min_size;
         p->max_size = max_size;
@@ -728,7 +772,6 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        delete p;
         micro::print_process_infos();
 
     }
@@ -738,7 +781,7 @@ DoneWithInput:
 #ifdef MICRO_BENCH_SNMALLOC
     {
         std::cout << "Larson snmalloc:" << std::endl;
-        Params* p = new Params();
+	    Params* p = get_params();
         p->name = "snmalloc";
         p->min_size = min_size;
         p->max_size = max_size;
@@ -752,7 +795,6 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        delete p;
         micro::print_process_infos();
 
     }
@@ -761,7 +803,7 @@ DoneWithInput:
 #ifdef MICRO_BENCH_MIMALLOC
     {
         std::cout << "Larson mimalloc:" << std::endl;
-        Params* p = new Params();
+	    Params* p = get_params();
         p->name = "mimalloc";
         p->min_size = min_size;
         p->max_size = max_size;
@@ -775,7 +817,6 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        delete p;
         micro::print_process_infos();
         
     }
@@ -785,7 +826,7 @@ DoneWithInput:
 #ifdef USE_TBB
     {
         std::cout << "Larson onetbb:" << std::endl;
-        Params* p = new Params();
+	    Params* p = get_params();
         p->name = "onetbb";
         p->min_size = min_size;
         p->max_size = max_size;
@@ -799,7 +840,6 @@ DoneWithInput:
 #else
         runloops(&p, sleep_cnt, num_chunks);
 #endif
-        delete p;
         micro::print_process_infos();
     }
 #endif

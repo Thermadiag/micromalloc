@@ -278,10 +278,7 @@ namespace micro
 	template<class Iter>
 	void random_shuffle(Iter begin, Iter end, uint_fast32_t seed = 0)
 	{
-		std::random_device rd;
-		std::mt19937 g(rd());
-		if (seed)
-			g.seed(seed);
+		std::mt19937 g(seed);
 		std::shuffle(begin, end, g);
 	}
 
@@ -359,10 +356,94 @@ namespace micro
 		static void free_mem(void* p) { micro_free(p); }
 	};
 
+	/// @brief Operation counter for benchmarks
+	template<size_t MaxThreads>
+	class op_counter
+	{
+
+		volatile std::int64_t sizes[MaxThreads];
+		size_t ops[MaxThreads];
+		std::atomic<size_t> thread_count{ 0 };
+		std::atomic<size_t> peak{ 0 };
+
+	public:
+		op_counter() noexcept { reset(); }
+
+		void reset() noexcept
+		{
+			for (size_t i = 0; i < MaxThreads; ++i) {
+				ops[i] = 0;
+				sizes[i] = 0;
+			}
+			peak.store(0);
+			thread_count.store(0);
+		}
+
+		// Add an allocation of given size
+		void allocate(size_t size) noexcept
+		{
+			size_t idx = micro::this_thread_id();
+
+			// Compute maximum thread count
+			size_t tcount = thread_count.load(std::memory_order_relaxed);
+			while (idx >= tcount) {
+				if (thread_count.compare_exchange_strong(tcount, idx + 1)) {
+					tcount = idx + 1;
+					break;
+				}
+			}
+
+			// Add operation
+			++ops[idx];
+
+			// Compute total memory, update memory peak if necessary
+			sizes[idx] = sizes[idx] + (std::int64_t)size;
+			std::int64_t tot = 0;
+			for (size_t i = 0; i < tcount + 1; ++i)
+				tot += sizes[i];
+
+			if (tot > 0) {
+				size_t utot = (size_t)tot;
+				size_t p = peak.load(std::memory_order_relaxed);
+				while (utot > p) {
+					if (peak.compare_exchange_strong(p, utot))
+						break;
+				}
+			}
+		}
+
+		// Add a deallocation
+		void deallocate(size_t size) noexcept
+		{
+			size_t idx = micro::this_thread_id();
+			sizes[idx] = sizes[idx] - (std::int64_t)size;
+			++ops[idx];
+		}
+
+		// Retrieve memory peak
+		size_t memory_peak() const noexcept { return peak.load(std::memory_order_relaxed); }
+
+		// Retrieve total operations
+		size_t total_ops() const noexcept
+		{
+			size_t tot = 0;
+			for (size_t i = 0; i < MaxThreads; ++i)
+				tot += ops[i];
+			return tot;
+		}
+	};
+
+	struct null_counter
+	{
+		void allocate(size_t) {}
+		void deallocate(size_t) {}
+	};
+
 	/// @brief Test allocator, to be used with MiMalloc, TBBMalloc,...
 	/// @tparam T
 	/// @tparam Alloc
-	template<class T, class Alloc>
+	/// @tparam OpCounter operation counter (op_counter<> or null_counter)
+	template<class T, class Alloc, class OpCounter = null_counter>
 	class testing_allocator
 	{
 
@@ -377,41 +458,52 @@ namespace micro
 		using propagate_on_container_swap = std::true_type;
 		using propagate_on_container_copy_assignment = std::true_type;
 		using propagate_on_container_move_assignment = std::true_type;
-		using is_always_equal = std::true_type;
+		using is_always_equal = std::false_type;
 		template<class U>
 		struct rebind
 		{
-			using other = testing_allocator<U, Alloc>;
+			using other = testing_allocator<U, Alloc, OpCounter>;
 		};
 
-		auto select_on_container_copy_construction() const noexcept -> testing_allocator<T, Alloc> { return *this; }
+		auto select_on_container_copy_construction() const noexcept -> testing_allocator<T, Alloc, OpCounter> { return *this; }
 
-		testing_allocator() noexcept = default;
+		OpCounter* cnt;
+
+		testing_allocator(OpCounter* c = nullptr) noexcept
+		  : cnt(c)
+		{
+		}
 		testing_allocator(const testing_allocator& other) noexcept = default;
 		template<class U>
-		testing_allocator(const testing_allocator<U, Alloc>&) noexcept
+		testing_allocator(const testing_allocator<U, Alloc, OpCounter>& other) noexcept
+		  : cnt(other.cnt)
 		{
 		}
 		~testing_allocator() noexcept = default;
 
-		auto operator==(const testing_allocator& other) const noexcept -> bool { return true; }
-		auto operator!=(const testing_allocator& other) const noexcept -> bool { return false; }
+		auto operator==(const testing_allocator& other) const noexcept -> bool { return cnt == other.cnt; }
+		auto operator!=(const testing_allocator& other) const noexcept -> bool { return cnt != other.cnt; }
 		auto address(reference x) const noexcept -> pointer { return std::addressof(x); }
 		auto address(const_reference x) const noexcept -> const_pointer { return std::addressof(x); }
 		auto allocate(size_t n, const void* /*unused*/) -> value_type* { return allocate(n); }
 		auto allocate(size_t n) -> value_type*
 		{
-			value_type* p = static_cast<value_type*>(Alloc::alloc_mem(n * sizeof(T)));
+			size_t size = n * sizeof(T);
+			value_type* p = static_cast<value_type*>(Alloc::alloc_mem(size));
 			if (MICRO_UNLIKELY(!p))
 				throw std::bad_alloc();
+			if (cnt)
+				cnt->allocate(size);
 			return p;
 		}
 		void deallocate(value_type* p, size_t n) noexcept
 		{
-			(void)n;
 			Alloc::free_mem(p);
+			if (cnt)
+				cnt->deallocate(n * sizeof(T));
 		}
 	};
+
 
 	inline void print_process_infos()
 	{

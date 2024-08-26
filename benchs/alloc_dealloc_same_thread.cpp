@@ -67,8 +67,7 @@ void test_allocator(const char* allocator, size_t max_size, size_t max_mem)
 	size_t total = 0;
 	size_t additional = 0;
 	{
-		std::random_device dev;
-		std::mt19937 rng(dev());
+		std::mt19937 rng(0);
 		std::uniform_int_distribution<std::mt19937::result_type> dist(0, max_size); // distribution in range [0, max_size]
 
 		std::vector<void*, micro::testing_allocator<void*,T>> ptr(alloc_count);
@@ -110,20 +109,6 @@ void test_allocator(const char* allocator, size_t max_size, size_t max_mem)
 
 int alloc_dealloc_same_thread(int, char** const)
 {
-	union Node
-	{
-		std::atomic<int> access; // one byte
-		struct
-		{
-			uint32_t reserved : 8;
-			uint32_t size : 23;
-			uint32_t isnull : 1;
-		};
-		Node() {}
-	};
-	Node n;
-	n.reserved;
-
 	using namespace micro;
 
 	unsigned max_size = 0;

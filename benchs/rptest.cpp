@@ -188,7 +188,7 @@ timer_ticks_to_seconds(uint64_t ticks) {
 
 
 #define MAX_THREADS 20
-
+#define THREADS 10
 
 typedef void* (*CUSTOM_MALLOC_P)(size_t);
 typedef void (*CUSTOM_FREE_P)(void*);
@@ -206,83 +206,41 @@ int benchmark_thread_initialize(void) {return 0;}
 int benchmark_thread_finalize(void) {return 0;}
 void benchmark_thread_collect(void) {}
 
-static std::atomic<std::uint64_t> peak;
-
-class Counter
-{
-	std::atomic<size_t> sizes[MAX_THREADS];
-	std::atomic<size_t> max_threads;
-
-public:
-	void reset() {
-		for (size_t i = 0; i < MAX_THREADS; ++i) {
-			sizes[i] = 0;
-		}
-	}
-	Counter() { reset();}
-
-	size_t add(size_t size)
-	{
-		size_t id = micro::this_thread_id();
-		size_t m = max_threads.load(std::memory_order_relaxed);
-		while (id > m) {
-			if (max_threads.compare_exchange_strong(m, id)) {
-				m = id;
-				break;
-			}
-		}
-		sizes[id] += size;
-		m = max_threads.load(std::memory_order_relaxed);
-		size_t tot = 0;
-		for (size_t i = 0; i <= m; ++i)
-			tot += sizes[i].load(std::memory_order_relaxed);
-		return tot;
-	}
-	void sub(size_t size)
-	{ 
-		sizes[micro::this_thread_id()] -= size;
-	}
-
-	size_t total() const
-	{
-		size_t tot = 0;
-		for (size_t i = 0; i < MAX_THREADS; ++i)
-			tot += sizes[i].load(std::memory_order_relaxed);
-		return tot;
-	}
-};
-
-static Counter counter;
 
 
-void* benchmark_malloc(size_t alignment, size_t size)
+static micro::op_counter<MAX_THREADS>* counter = nullptr;
+
+
+MICRO_ALWAYS_INLINE void* benchmark_malloc(size_t alignment, size_t size)
 {
 	return CUSTOM_MALLOC(size);
 }
 
 
-void* benchmark_malloc_size(size_t alignment, size_t size) {
+MICRO_ALWAYS_INLINE void* benchmark_malloc_size(size_t alignment, size_t size)
+{
 
 	void * p = CUSTOM_MALLOC(size);
-	/**(uint32_t*)p = (unsigned)size;
-	size_t max = counter.add(size);
-	if (max > peak.load(std::memory_order_relaxed))
-		peak.store(max);
-	*/
+	if (counter) 
+		counter->allocate(size);
 	return p;
 }
 
-void benchmark_free(void* ptr) {
-	CUSTOM_FREE(ptr);
-}
-
-void benchmark_free_size(void* ptr)
+MICRO_ALWAYS_INLINE void benchmark_free(void* ptr)
 {
-	//counter.sub(*(uint32_t*)ptr);
 	CUSTOM_FREE(ptr);
 }
 
-const char* benchmark_name(void) {
+template<class T>
+MICRO_ALWAYS_INLINE void benchmark_free_size(void* ptr, T size)
+{
+	if(counter)
+		counter->deallocate((size_t)size);
+	CUSTOM_FREE(ptr);
+}
+
+MICRO_ALWAYS_INLINE const char* benchmark_name(void)
+{
 	return CUSTOM_NAME;
 }
 
@@ -620,7 +578,7 @@ benchmark_worker(void* argptr) {
 	benchmark_thread_initialize();
 
 	size_t pointers_size = sizeof(void*) * arg->alloc_count;
-	pointers = (void**)benchmark_malloc(16, pointers_size);
+	pointers = (void**)benchmark_malloc_size(16, pointers_size);
 	memset(pointers, 0, pointers_size);
 	atomic_add32(&arg->allocated, (int32_t)pointers_size);
 
@@ -648,7 +606,7 @@ benchmark_worker(void* argptr) {
 			for (iop = 0; iop < free_op_count; ++iop) {
 				if (pointers[free_idx]) {
 					allocated -= *(int32_t*)pointers[free_idx];
-					benchmark_free_size(pointers[free_idx]);
+					benchmark_free_size(pointers[free_idx], *(int32_t*)pointers[free_idx]);
 					++arg->mops;
 					pointers[free_idx] = 0;
 				}
@@ -660,15 +618,15 @@ benchmark_worker(void* argptr) {
 				int32_t foreign_allocated = 0;
 				for (iop = 0; iop < foreign->count; ++iop) {
 					foreign_allocated -= *(int32_t*)foreign->pointers[iop];
-					benchmark_free_size(foreign->pointers[iop]); // ERROR wityh cross_count non 0
+					benchmark_free_size(foreign->pointers[iop], *(int32_t*)foreign->pointers[iop]); // ERROR wityh cross_count non 0
 					++arg->mops;
 				}
 
 				void* next = foreign->next;
 				foreign_allocated -= (int32_t)(foreign->count * sizeof(void*) + sizeof(thread_pointers));
 				atomic_add32(foreign->allocated, foreign_allocated);
-				benchmark_free(foreign->pointers);
-				benchmark_free(foreign);
+				benchmark_free_size(foreign->pointers, foreign->count* sizeof(void*));
+				benchmark_free_size(foreign, sizeof(thread_pointers));
 				arg->mops += 2;
 				foreign = (thread_pointers*)next;
 			}
@@ -676,7 +634,7 @@ benchmark_worker(void* argptr) {
 			for (iop = 0; iop < alloc_op_count; ++iop) {
 				if (pointers[alloc_idx]) {
 					allocated -= *(int32_t*)pointers[alloc_idx];
-					benchmark_free_size(pointers[alloc_idx]);
+					benchmark_free_size(pointers[alloc_idx], *(int32_t*)pointers[alloc_idx]);
 					++arg->mops;
 				}
 				size_t size = arg->min_size;
@@ -698,9 +656,9 @@ benchmark_worker(void* argptr) {
 
 			foreign = 0;
 			if (arg->cross_rate && ((iloop % arg->cross_rate) == 0) && (do_foreign > 0)) {
-				foreign = (thread_pointers*)benchmark_malloc(16, sizeof(thread_pointers));
+				foreign = (thread_pointers*)benchmark_malloc_size(16, sizeof(thread_pointers));
 				foreign->count = alloc_op_count;
-				foreign->pointers = (void**)benchmark_malloc(16, sizeof(void*) * alloc_op_count);
+				foreign->pointers = (void**)benchmark_malloc_size(16, sizeof(void*) * alloc_op_count);
 				foreign->allocated = &arg->allocated;
 				allocated += (int32_t)(alloc_op_count * sizeof(void*) + sizeof(thread_pointers));
 				arg->mops += 2;
@@ -786,15 +744,15 @@ benchmark_worker(void* argptr) {
 					allocated = 0;
 					for (iop = 0; iop < foreign->count; ++iop) {
 						allocated -= *(int32_t*)foreign->pointers[iop];
-						benchmark_free_size(foreign->pointers[iop]);
+						benchmark_free_size(foreign->pointers[iop], *(int32_t*)foreign->pointers[iop]);
 						++arg->mops;
 					}
 
 					void* next = foreign->next;
 					allocated -= (int32_t)(foreign->count * sizeof(void*) + sizeof(thread_pointers));
 					atomic_add32(foreign->allocated, allocated);
-					benchmark_free(foreign->pointers);
-					benchmark_free(foreign);
+					benchmark_free_size(foreign->pointers, foreign->count * sizeof(void*));
+					benchmark_free_size(foreign, sizeof(thread_pointers));
 					arg->mops += 2;
 					foreign = (thread_pointers*)next;
 				}
@@ -811,7 +769,7 @@ benchmark_worker(void* argptr) {
 		for (size_t iptr = 0; iptr < arg->alloc_count; ++iptr) {
 			if (pointers[iptr]) {
 				allocated -= *(int32_t*)pointers[iptr];
-				benchmark_free_size(pointers[iptr]);
+				benchmark_free_size(pointers[iptr], *(int32_t*)pointers[iptr]);
 				++arg->mops;
 				pointers[iptr] = 0;
 			}
@@ -827,11 +785,11 @@ benchmark_worker(void* argptr) {
 		foreign = get_cross_thread_memory(&arg->foreign);
 		while (foreign) {
 			for (iop = 0; iop < foreign->count; ++iop)
-				benchmark_free_size(foreign->pointers[iop]);
+				benchmark_free_size(foreign->pointers[iop], *(int32_t*)foreign->pointers[iop]);
 
 			void* next = foreign->next;
-			benchmark_free(foreign->pointers);
-			benchmark_free(foreign);
+			benchmark_free_size(foreign->pointers, foreign->count * sizeof(void*));
+			benchmark_free_size(foreign,sizeof(thread_pointers));
 			foreign = (thread_pointers*)next;
 		}
 
@@ -857,15 +815,15 @@ benchmark_worker(void* argptr) {
 				allocated = 0;
 				for (iop = 0; iop < foreign->count; ++iop) {
 					allocated -= *(int32_t*)foreign->pointers[iop];
-					benchmark_free_size(foreign->pointers[iop]);
+					benchmark_free_size(foreign->pointers[iop], *(int32_t*)foreign->pointers[iop]);
 					++arg->mops;
 				}
 
 				void* next = foreign->next;
 				allocated -= (int32_t)(foreign->count * sizeof(void*) + sizeof(thread_pointers));
 				atomic_add32(foreign->allocated, allocated);
-				benchmark_free(foreign->pointers);
-				benchmark_free(foreign);
+				benchmark_free_size(foreign->pointers, foreign->count * sizeof(void*));
+				benchmark_free_size(foreign,sizeof(thread_pointers));
 				arg->mops += 2;
 				foreign = (thread_pointers*)next;
 			}
@@ -877,7 +835,7 @@ benchmark_worker(void* argptr) {
 		thread_fence();
 	} while (atomic_load32(&benchmark_threads_sync));
 
-	benchmark_free(pointers);
+	benchmark_free_size(pointers, sizeof(void*) * arg->alloc_count);
 	atomic_add32(&arg->allocated, -(int32_t)pointers_size);
 
 	benchmark_thread_finalize();
@@ -887,7 +845,7 @@ benchmark_worker(void* argptr) {
 	thread_exit(0);
 }
 
-int
+size_t
 benchmark_run(int argc, char** argv, bool init) {
 	if (timer_initialize() < 0)
 		return -1;
@@ -907,6 +865,8 @@ benchmark_run(int argc, char** argv, bool init) {
 			"         <max size>         Maximum size for random mode, ignored for fixed mode\n");
 		return -3;
 	}*/
+
+	
 
 	size_t thread_count = 10;// (size_t)strtol(argv[1], 0, 10);
 #ifndef MICRO_TEST_THREAD
@@ -961,7 +921,8 @@ benchmark_run(int argc, char** argv, bool init) {
 	if (thread_count == 1)
 		cross_rate = 0;
 
-	
+	micro::op_counter<MAX_THREADS> cc;
+	counter = &cc;
 
 	if (init) {
 		size_t iprime = 0;
@@ -1011,8 +972,8 @@ benchmark_run(int argc, char** argv, bool init) {
 	benchmark_arg* arg;
 	uintptr_t* thread_handle;
 
-	arg = (benchmark_arg * )benchmark_malloc(0, sizeof(benchmark_arg) * thread_count);
-	thread_handle = (uintptr_t * )benchmark_malloc(0, sizeof(thread_handle) * thread_count);
+	arg = (benchmark_arg * )benchmark_malloc_size(0, sizeof(benchmark_arg) * thread_count);
+	thread_handle = (uintptr_t*)benchmark_malloc_size(0, sizeof(thread_handle) * thread_count);
 
 	benchmark_start = 0;
 
@@ -1135,8 +1096,8 @@ benchmark_run(int argc, char** argv, bool init) {
 	if (!ticks)
 		ticks = 1;
 
-	benchmark_free(thread_handle);
-	benchmark_free(arg);
+	benchmark_free_size(thread_handle, sizeof(thread_handle) * thread_count);
+	benchmark_free_size(arg, sizeof(benchmark_arg) * thread_count);
 
 	micro::allocator_trim(CUSTOM_NAME);
 
@@ -1182,9 +1143,16 @@ benchmark_run(int argc, char** argv, bool init) {
 	if (benchmark_finalize() < 0)
 		return -4;
 
+	if (counter) {
+		double overhead = (infos.peak_rss);
+		overhead /= (double)counter->memory_peak();
+		printf("Memory overhead: %f\n", overhead);
+	}
 	//micro::print_process_infos();
 
+	counter = nullptr;
 	return 0;
+	
 }
 
 #if ( defined( __APPLE__ ) && __APPLE__ )
@@ -1200,7 +1168,7 @@ int
 rptest(int argc, char** const argv) {
 
 	benchmark_run(0, nullptr,true);
-	
+	size_t total;
 #ifdef MICRO_BENCH_MICROMALLOC
 	 {
 		//micro_set_parameter(MicroProviderType, MicroOSPreallocProvider);
@@ -1211,20 +1179,21 @@ rptest(int argc, char** const argv) {
 		//micro_set_parameter(MicroPrintStatsTrigger, 1);
 		//micro_set_parameter(MicroSmallAllocThreshold, 512);
 		//micro_set_string_parameter(MicroPrintStats, "stdout");
-		 counter.reset();
-		peak = 0;
+		 if (counter)
+			 counter->reset();
 		CUSTOM_MALLOC = micro_malloc;
 		CUSTOM_FREE = micro_free;
 		CUSTOM_REALLOC = micro_realloc;
 		CUSTOM_USABLE = nullptr;//micro_usable_size;
 		CUSTOM_NAME = "micro";
 		benchmark_run(argc, argv, false);
+		return 0;
 	}
 #endif
 
 #ifdef MICRO_BENCH_MALLOC
-	counter.reset();
-	peak = 0;
+	if (counter)
+		counter->reset();
 	CUSTOM_MALLOC = malloc;
 	CUSTOM_FREE = free;
 	CUSTOM_REALLOC = realloc;
@@ -1235,7 +1204,8 @@ rptest(int argc, char** const argv) {
 	
 #ifdef MICRO_BENCH_JEMALLOC
 	counter.reset();
-	peak = 0;
+	if (counter)
+		counter->reset();
 	//const char* je_malloc_conf = "dirty_decay_ms:0";
 	CUSTOM_MALLOC = je_malloc;
 	CUSTOM_FREE = je_free;
@@ -1246,8 +1216,8 @@ rptest(int argc, char** const argv) {
 #endif
 	
 #ifdef MICRO_BENCH_MIMALLOC
-	counter.reset();
-	peak = 0;
+	if (counter)
+		counter->reset();
 	CUSTOM_MALLOC = mi_malloc;
 	CUSTOM_FREE = mi_free;
 	CUSTOM_REALLOC = mi_realloc;
@@ -1257,8 +1227,8 @@ rptest(int argc, char** const argv) {
 #endif
 
 #ifdef MICRO_BENCH_SNMALLOC
-	counter.reset();
-	peak = 0;
+	if (counter)
+		counter->reset();
 	CUSTOM_MALLOC = snmalloc::libc::malloc;;
 	CUSTOM_FREE = snmalloc::libc::free;
 	CUSTOM_REALLOC = snmalloc::libc::realloc;
@@ -1268,8 +1238,8 @@ rptest(int argc, char** const argv) {
 #endif
 
 #ifdef USE_TBB
-	counter.reset();
-	peak = 0;
+	if (counter)
+		counter->reset();
 	CUSTOM_MALLOC = scalable_malloc;
 	CUSTOM_FREE = scalable_free;
 	CUSTOM_REALLOC = scalable_realloc;
