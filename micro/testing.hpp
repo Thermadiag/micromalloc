@@ -265,6 +265,12 @@ namespace micro
 			thread_local timer t;
 			return t;
 		}
+		inline void commit_mem(void * p, size_t s) noexcept
+		{
+			size_t pcount = s / 4096u + ((s & 4095u) ? 1u : 0u);
+			for(size_t i=0; i < pcount; ++i)
+				*(static_cast<char*>(p) + i * 4096u) = 0;
+		}
 	}
 	/// @brief For tests only, reset timer for calling thread
 	inline void tick() { detail::local_timer().tick(); }
@@ -287,7 +293,7 @@ namespace micro
 		static void* alloc_mem(size_t i)
 		{
 			void* p = malloc(i);
-			memset(p, 0, i);
+			detail::commit_mem(p,i);
 			return p;
 		}
 		static void free_mem(void* p) { free(p); }
@@ -299,7 +305,7 @@ namespace micro
 		static void* alloc_mem(size_t i)
 		{
 			void* p = mi_malloc(i);
-			memset(p, 0, i);
+			detail::commit_mem(p,i);
 			return p;
 		}
 		static void free_mem(void* p) { mi_free(p); }
@@ -312,7 +318,7 @@ namespace micro
 		static void* alloc_mem(size_t i)
 		{
 			void* p = scalable_malloc(i);
-			memset(p, 0, i);
+			detail::commit_mem(p,i);
 			return p;
 		}
 		static void free_mem(void* p) { scalable_free(p); }
@@ -325,7 +331,7 @@ namespace micro
 		static void* alloc_mem(size_t i)
 		{
 			void* p = snmalloc::libc::malloc(i);
-			memset(p, 0, i);
+			detail::commit_mem(p,i);
 			return p;
 		}
 		static void free_mem(void* p) { snmalloc::libc::free(p); }
@@ -338,7 +344,7 @@ namespace micro
 		static void* alloc_mem(size_t i)
 		{
 			void* p = je_malloc(i);
-			memset(p, 0, i);
+			detail::commit_mem(p,i);
 			return p;
 		}
 		static void free_mem(void* p) { je_free(p); }
@@ -350,7 +356,7 @@ namespace micro
 		static void* alloc_mem(size_t i)
 		{
 			char* p = (char*)micro_malloc(i);
-			memset(p, 0, i);
+			detail::commit_mem(p,i);
 			return p;
 		}
 		static void free_mem(void* p) { micro_free(p); }

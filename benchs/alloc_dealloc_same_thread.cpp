@@ -71,7 +71,7 @@ void test_allocator(const char* allocator, size_t max_size, size_t max_mem)
 		std::uniform_int_distribution<std::mt19937::result_type> dist(0, max_size); // distribution in range [0, max_size]
 
 		std::vector<void*, micro::testing_allocator<void*,T>> ptr(alloc_count);
-		std::vector<unsigned, micro::testing_allocator<unsigned*, T>> ss(ptr.size());
+		std::vector<unsigned, micro::testing_allocator<unsigned, T>> ss(ptr.size());
 
 		for (size_t i = 0; i < ss.size(); ++i) {
 			ss[i] = (unsigned)dist(rng);

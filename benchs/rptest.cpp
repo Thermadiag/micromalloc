@@ -1187,7 +1187,6 @@ rptest(int argc, char** const argv) {
 		CUSTOM_USABLE = nullptr;//micro_usable_size;
 		CUSTOM_NAME = "micro";
 		benchmark_run(argc, argv, false);
-		return 0;
 	}
 #endif
 
@@ -1203,7 +1202,6 @@ rptest(int argc, char** const argv) {
 #endif
 	
 #ifdef MICRO_BENCH_JEMALLOC
-	counter.reset();
 	if (counter)
 		counter->reset();
 	//const char* je_malloc_conf = "dirty_decay_ms:0";
