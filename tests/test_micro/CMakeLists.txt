@@ -70,6 +70,9 @@ endif()
 
 target_compile_definitions(micro_tests PRIVATE -DMICRO_TEST_THREAD=8)
 target_compile_definitions(micro_tests PRIVATE -DMICRO_TEST_SIZE=5000)
+target_compile_definitions(micro_tests PRIVATE -DMICRO_BENCH_MICROMALLOC)
+target_compile_definitions(micro_tests PRIVATE -DMICRO_TEST_MICROMALLOC)
+target_compile_definitions(micro_tests PRIVATE -DMICRO_DEBUG)
 
 target_compile_definitions(micro_tests PRIVATE MICRO_MEMORY_LEVEL=${MICRO_MEMORY_LEVEL})
 

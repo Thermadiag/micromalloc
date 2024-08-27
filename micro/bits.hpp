@@ -401,7 +401,11 @@ static constexpr void* __dummy_ptr_with_long_name = nullptr;
 #ifndef MICRO_DEBUG
 #define MICRO_ASSERT_DEBUG(condition, msg)
 #else
+#ifdef NDEBUG
+#define MICRO_ASSERT_DEBUG(condition, ...) MICRO_ASSERT(condition, __VA_ARGS__)
+#else
 #define MICRO_ASSERT_DEBUG(condition, ...) assert((condition) && (__VA_ARGS__))
+#endif
 #endif
 
 #ifdef MICRO_DEBUG
