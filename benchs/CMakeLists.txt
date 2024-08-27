@@ -16,6 +16,7 @@ create_test_sourcelist (Benchs
   xmalloc.cpp
   malloc_survey.cpp
   alloc_test.cpp
+  heavy_threads.cpp
   )
 
 # add the executable
