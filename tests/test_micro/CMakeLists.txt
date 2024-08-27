@@ -18,6 +18,7 @@ create_test_sourcelist (Tests
   xmalloc.cpp
   malloc_survey.cpp
   alloc_test.cpp
+  heavy_threads.cpp
   )
 
 # add the executable
@@ -33,7 +34,8 @@ add_executable (micro_tests micro_tests.cpp
   ../../benchs/malloc_large.cpp
   ../../benchs/xmalloc.cpp
   ../../benchs/malloc_survey.cpp
-  ../../benchs/alloc_test.cpp)
+  ../../benchs/alloc_test.cpp
+  ../../benchs/heavy_threads.cpp)
 
 set_property(TARGET micro_tests PROPERTY CXX_STANDARD 14)
 

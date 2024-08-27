@@ -54,8 +54,6 @@ void loop_over(ThreadData * data, std::vector<std::atomic<void*>>& ptr)
 
 	if (data->loop_count++ < MAX_LOOP_COUNT) {
 		std::thread([&ptr, data]() { loop_over(data, ptr); }).detach();
-		if (data->loop_count % 20 == 0)
-			printf("%d\n", data->loop_count);
 	}
 	else
 		finish_count++;
