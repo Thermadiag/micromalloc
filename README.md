@@ -19,6 +19,7 @@ Micro is usually (but not always) slower than well known allocators like *mimall
 
 The library is written in C++14 and should compile on most platforms with gcc, clang or msvc. A header only mode is provided for quick benchmarking. 
 
+A few benchmarks are available [here](md/benchmarks.md).
 
 Replacing system allocator
 --------------------------
@@ -136,6 +137,13 @@ Micro relies on cmake for building and integration in other projects. List of al
 See this [cmake file](tests/test_cmake/CMakeLists.txt) file for examples of targets using either *micro*, *micro_static* or *micro_proxy* libraries.
 
 Note that if using *micro_static*, *MICRO_STATIC* must be defined.
+
+
+Benchmarks
+----------
+
+The library embedds several benchmarks in the `benchs` folder.
+Some of them are presented in the [benchmarks](md/benchmarks.md) page.
 
 Remaining work
 --------------
