@@ -21,6 +21,15 @@ The library is written in C++14 and should compile on most platforms with gcc, c
 
 A few benchmarks are available [here](md/benchmarks.md).
 
+C and C++ interfaces
+--------------------
+
+Micro library is written in C++ but the compiled library (static or shared) can be used from C only codes.
+For pure C code, include `micro/micro.h` header. For C/C++ code, `micro/micro.hpp` should be used as it provides both C and C++ interfaces.
+See the [examples](md/examples.md) page for more details.
+
+Furthermore, the `micro` folder can be directly included in a foreign C++ application without compilation (header-only mode). In this case, the macro `MICRO_HEADER_ONLY` must be defined.
+
 Replacing system allocator
 --------------------------
 
