@@ -1,10 +1,10 @@
 Micromalloc has been benchmarked against various allocators for several scenarios. These benchmarks are available in the library, and were mostly used to tune and correct the allocator.
-This section presents 3 types of benchmarks and compares micromalloc to glibc malloc (v2.17), jemalloc (v5.3.0), mimalloc (v1.8) and snmalloc (v3.14).
+This section presents 3 types of benchmarks and compares micromalloc to glibc malloc (v2.17), <a href="https://github.com/jemalloc/jemalloc">jemalloc</a> (v5.3.0), <a href="https://github.com/microsoft/mimalloc">mimalloc</a> (v1.8) and <a href="https://github.com/microsoft/snmalloc">snmalloc</a> (v3.14).
 Code was compiled with gcc 10.3.0 and ran on a Linux CentOS 7. The machine is equipped with a Intel(R) Xeon(R) Gold 5220R CPU @ 2.20GHz, 95 processors.
 
 We clear ALL allocated memory at the end of each benchmark and this is counted in the performance measurement. Indeed most allocators do not always free pages on deallocation in order to speed up further allocations, as page allocation is usually a time consuming operation.
 This is fine when the allocator is used to speedup one application, but (in my opinion) inefficient when replacing the default allocator system wide as it will consume a LOT of additional memory. 
-Default allocators like glibc malloc or (especially) Windows Low-fragmentation Heap will decommit (but not necessarily release) pages as soon as possible to decrease global memory usage. Micromalloc will decommit pages as soon as they do not contain used chunks.
+Default allocators like glibc malloc or (especially) Windows Low-fragmentation Heap will decommit (but not necessarily release) pages as soon as possible to decrease global memory usage. Micromalloc will also decommit pages as soon as they do not contain used chunks.
 
 Therefore:
 -	jemalloc is configured with `dirty_decay_ms:0,muzzy_decay_ms=0`. This is the only way I found to ensure immediate page decommitment (I think?)
@@ -60,11 +60,11 @@ The following figure displays Larson benchmark results for up to 10 threads, wit
 ![image](images/larson.svg)
 
 Micromalloc seems to scale well compared to the other allocators. This might be a measurement of the way threads are handled by each allocator. The Larson benchmark creates and destroys LOTs of threads that perform a low amount of operations.
-If an allocator heavily rely on thread local metadata with non straightforward initialization/destruction, it will perform poorly on the Larson becnhmark. As opposed to micromalloc that only affect a unique Id to spawn threads, and use this Id to select an arena.
+If an allocator heavily rely on thread local metadata with non straightforward initialization/destruction, it will perform poorly on the Larson becnhmark. As opposed to micromalloc that only affects a unique ID to spawn threads, and use this ID to select an arena.
 
 
 Other benchmarks
 ----------------
 
-The `benchs` folder of contains additional benchmark were micromalloc performs quite well, but the exact memory overhead of each allocator is harder to extract without impacting the real performances. 
-These benchmarks were taken from other git repositories, check the README for their addresses. 
+The `benchs` folder contains additional benchmark were micromalloc performs quite well, but the exact memory overhead of each allocator is harder to extract without impacting the real performances. 
+These benchmarks were taken from other git repositories, check the [README](../README.md) for their addresses. 
