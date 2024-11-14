@@ -56,6 +56,7 @@ namespace micro
 				return 64;
 			}
 			MICRO_ALWAYS_INLINE unsigned scan_forward_small(unsigned start) const noexcept { return scan_forward(start); }
+			MICRO_ALWAYS_INLINE bool has_first_bit() const noexcept { return mask.load(std::memory_order_relaxed) & 1u; }
 		};
 
 		/// @brief Generic N bits integer for 64 bits platforms
@@ -164,6 +165,7 @@ namespace micro
 					return bit_scan_forward_32(m);
 				return N * 32u;
 			}
+			MICRO_ALWAYS_INLINE bool has_first_bit() const noexcept { return masks[0].load(std::memory_order_relaxed) & 1u; }
 		};
 
 		using UInt64 = UIntN_32bits<2>;
